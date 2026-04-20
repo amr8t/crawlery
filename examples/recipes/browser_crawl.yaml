@@ -1,0 +1,87 @@
+# Browser Crawl Recipe
+# Example configuration for crawling JavaScript-heavy sites using headless browser
+
+# Starting URL to crawl
+url: "https://example.com"
+
+# Crawl mode: browser (for JavaScript-heavy sites)
+# Use browser mode when the site requires JavaScript execution
+mode: browser
+
+# Maximum depth to crawl from the start URL
+max_depth: 2
+
+# Maximum number of pages to crawl
+# Browser mode is slower, so limiting pages is recommended
+max_pages: 50
+
+# Output file path
+output_path: "browser_crawl_results.json"
+
+# Output format: json, json-pretty, markdown, csv, or text
+output_format: json-pretty
+
+# State file for resumable crawling
+# Browser crawls can be slow, so resumability is important
+state_file: "browser_crawl_state.json"
+
+# Request timeout in seconds
+# Browser mode typically needs longer timeouts for page rendering
+timeout_secs: 60
+
+# Maximum number of concurrent requests
+# Lower concurrency for browser mode to avoid resource exhaustion
+max_concurrent_requests: 3
+
+# Delay between requests in milliseconds
+# Higher delay recommended for browser mode to allow proper rendering
+delay_ms: 2000
+
+# Maximum number of retries per request
+max_retries: 2
+
+# Follow HTTP redirects
+follow_redirects: true
+
+# Respect robots.txt rules
+respect_robots_txt: true
+
+# URL patterns to include (regex)
+# Example: Only crawl specific sections of a site
+include_patterns:
+  - "^https://example\\.com/app/"
+  - "^https://example\\.com/dashboard/"
+
+# URL patterns to exclude (regex)
+exclude_patterns:
+  - "\\.pdf$"
+  - "\\.zip$"
+  - "/api/"
+  - "/logout$"
+
+# CSS selectors to extract specific content
+# Useful for extracting rendered content from specific elements
+css_selectors:
+  - "main"
+  - "article"
+  - ".content"
+
+# Custom HTTP headers
+headers:
+  Accept-Language: "en-US,en;q=0.9"
+
+# User agent string (optional)
+# Browser mode uses a real browser, so this may be ignored
+user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Proxy configuration (optional)
+# proxy:
+#   url: "http://proxy.example.com:8080"
+#   username: "user"
+#   password: "pass"
+
+# Notes:
+# - Browser mode is slower but handles JavaScript-rendered content
+# - Use for single-page applications (SPAs), React/Vue/Angular sites
+# - Lower concurrency and higher delays prevent browser resource issues
+# - Longer timeouts account for page rendering and asset loading

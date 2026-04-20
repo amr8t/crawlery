@@ -1,0 +1,109 @@
+# Resumable Crawl Recipe
+# Example configuration for long-running crawls that can be paused and resumed
+
+# Starting URL to crawl
+url: "https://docs.example.com"
+
+# Crawl mode: http or browser
+mode: http
+
+# Maximum depth to crawl (larger for comprehensive crawls)
+max_depth: 5
+
+# Maximum number of pages (can be large or null for unlimited)
+# Set to null or a high number for long-running crawls
+max_pages: 10000
+
+# Output file path - results will be saved here
+output_path: "documentation_crawl.json"
+
+# Output format
+output_format: json-pretty
+
+# STATE FILE - Critical for resumable crawling!
+# This file saves crawl progress including:
+# - Visited URLs (to avoid re-crawling)
+# - Pending URLs (queue of URLs to crawl)
+# - Partial results
+# - Configuration
+#
+# To resume a crawl, use: crawlery --recipe resumable_crawl.yaml --resume
+state_file: "documentation_crawl.state"
+
+# Request timeout (reasonable timeout for stability)
+timeout_secs: 60
+
+# Lower concurrency for more stable long-running crawls
+max_concurrent_requests: 5
+
+# Add delay to be respectful and avoid rate limiting
+# Especially important for long crawls
+delay_ms: 500
+
+# Retries for transient failures
+max_retries: 5
+
+# Follow redirects
+follow_redirects: true
+
+# Always respect robots.txt for long crawls
+respect_robots_txt: true
+
+# Include only documentation pages
+include_patterns:
+  - "^https://docs\\.example\\.com/.*"
+  - "^https://.*\\.example\\.com/docs/.*"
+
+# Exclude non-content files and patterns
+exclude_patterns:
+  - "\\.pdf$"
+  - "\\.zip$"
+  - "\\.tar\\.gz$"
+  - "\\.exe$"
+  - "\\.dmg$"
+  - "\\?download="
+  - "/download/"
+  - "/api/"
+  - "/login"
+  - "/logout"
+
+# Extract specific content sections (optional)
+css_selectors: []
+
+# Custom headers (optional)
+headers: {}
+
+# Custom user agent to identify your crawler
+user_agent: "Crawlery/1.0 (Documentation Crawler; +https://example.com/crawler)"
+
+# Proxy settings (optional)
+# proxy:
+#   url: "http://proxy.example.com:8080"
+#   username: null
+#   password: null
+
+# HOW TO USE THIS RECIPE:
+#
+# 1. Start the crawl:
+#    crawlery --recipe resumable_crawl.yaml -v
+#
+# 2. The crawl will save state periodically to 'documentation_crawl.state'
+#    You can stop the crawl at any time (Ctrl+C)
+#
+# 3. Resume the crawl from where it left off:
+#    crawlery --recipe resumable_crawl.yaml --resume -v
+#
+# 4. The crawler will:
+#    - Load the previous state
+#    - Skip already-visited URLs
+#    - Continue from the pending queue
+#    - Merge new results with existing results
+#
+# 5. You can resume multiple times until the crawl is complete
+#
+# TIPS:
+# - Use reasonable delays (delay_ms) to avoid overwhelming the server
+# - Lower concurrency (max_concurrent_requests) is more stable for long crawls
+# - Set max_pages to limit scope if needed
+# - The state file grows over time - monitor disk space for very large crawls
+# - Back up your state file periodically for very long crawls

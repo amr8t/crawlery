@@ -1,0 +1,61 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Compilation artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+*.rlib
+
+# Debug and release directories
+debug/
+release/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Crawler output files
+*.crawl.json
+*.crawl.md
+*.crawl.csv
+*.crawl.txt
+crawl_results/
+output/
+
+# Environment and config
+.env
+.env.local
+config.local.toml
+
+# Test artifacts
+tests/fixtures/generated/
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.tmp
+
+/out/*
+MILESTONES.md
+agents.md
+
+/temp

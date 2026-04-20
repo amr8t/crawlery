@@ -1,0 +1,105 @@
+# Documentation Crawl Recipe
+# Optimized for crawling documentation websites with URL filtering
+
+# Starting URL - typically the documentation homepage
+url: "https://docs.example.com"
+
+# Use HTTP mode for documentation (usually static pages)
+mode: http
+
+# Documentation sites can be deep, adjust as needed
+max_depth: 5
+
+# Limit to prevent excessive crawling
+max_pages: 500
+
+# Output settings
+output_path: "docs_crawl.json"
+output_format: markdown
+
+# State file for long-running documentation crawls
+state_file: "docs_crawl.state"
+
+# Request settings - be respectful to documentation servers
+timeout_secs: 30
+max_concurrent_requests: 5
+delay_ms: 500
+
+# Retry settings
+max_retries: 3
+follow_redirects: true
+respect_robots_txt: true
+
+# URL patterns to INCLUDE - only crawl documentation pages
+# These regex patterns ensure we stay within documentation
+include_patterns:
+  - "^https://docs\\.example\\.com/.*"
+  - "^https://example\\.com/docs/.*"
+  - "^https://example\\.com/documentation/.*"
+  - "^https://example\\.com/guide/.*"
+  - "^https://example\\.com/tutorial/.*"
+  - "^https://example\\.com/api/.*"
+  - "^https://example\\.com/reference/.*"
+
+# URL patterns to EXCLUDE - skip non-documentation content
+exclude_patterns:
+  # Binary and media files
+  - "\\.pdf$"
+  - "\\.zip$"
+  - "\\.tar\\.gz$"
+  - "\\.exe$"
+  - "\\.dmg$"
+  - "\\.mp4$"
+  - "\\.mp3$"
+  - "\\.avi$"
+  - "\\.mov$"
+  # Images (optional - uncomment if you want to skip)
+  # - "\\.jpg$"
+  # - "\\.jpeg$"
+  # - "\\.png$"
+  # - "\\.gif$"
+  # - "\\.svg$"
+  # Common non-documentation paths
+  - "/login"
+  - "/logout"
+  - "/signin"
+  - "/signup"
+  - "/register"
+  - "/auth/"
+  - "/admin/"
+  - "/blog/"
+  - "/news/"
+  - "/forum/"
+  - "/community/"
+  - "/download/"
+  - "/downloads/"
+  # External links
+  - "^https://github\\.com/.*"
+  - "^https://twitter\\.com/.*"
+  - "^https://facebook\\.com/.*"
+  # Query parameters that indicate non-content pages
+  - "\\?utm_"
+  - "\\?ref="
+  - "\\?source="
+
+# Extract specific documentation elements
+css_selectors:
+  - "article"
+  - ".documentation"
+  - ".doc-content"
+  - "main"
+  - ".markdown-body"
+
+# Custom headers - identify as documentation crawler
+headers:
+  User-Agent: "Crawlery Documentation Indexer/1.0"
+  Accept: "text/html,application/xhtml+xml"
+
+# Optional: Custom user agent
+user_agent: "Crawlery Documentation Crawler/1.0 (+https://example.com/crawler-info)"
+
+# Proxy configuration (if needed for accessing internal docs)
+# proxy:
+#   url: "http://proxy.internal.com:8080"
+#   username: null
+#   password: null

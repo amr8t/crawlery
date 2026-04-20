@@ -1,0 +1,62 @@
+[package]
+name = "crawlery"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A flexible web crawler with HTTP and browser automation support"
+license = "AGPL-3.0"
+repository = "https://github.com/yourusername/crawlery"
+keywords = ["web", "crawler", "scraper", "automation"]
+categories = ["web-programming", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "cookies"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# URL parsing
+url = "2.5"
+
+# HTML parsing
+scraper = "0.18"
+
+# Error handling
+anyhow = "1.0"
+
+# Retry logic
+tokio-retry = "0.3"
+
+# Browser automation
+headless_chrome = "1.0"
+
+# Pattern matching
+regex = "1.10"
+
+# Content extraction and markdown conversion
+html2md = "0.2"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[lib]
+name = "crawlery"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crawlery"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

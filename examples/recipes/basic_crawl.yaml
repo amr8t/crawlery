@@ -1,0 +1,68 @@
+# Basic Crawl Recipe
+# A simple example demonstrating basic web crawling configuration
+
+# Starting URL to crawl
+url: "https://example.com"
+
+# Crawl mode: http (fast) or browser (JavaScript support)
+mode: http
+
+# Maximum depth to crawl from the start URL
+# 0 = only the start URL, 1 = start URL + direct links, etc.
+max_depth: 3
+
+# Maximum number of pages to crawl (optional)
+# Comment out or set to null for unlimited
+max_pages: 100
+
+# Output file path
+output_path: "crawl_results.json"
+
+# Output format: json, json-pretty, markdown, csv, or text
+output_format: json-pretty
+
+# State file for resumable crawling (optional)
+# If specified, crawl progress will be saved and can be resumed
+state_file: "crawl_state.json"
+
+# Request timeout in seconds
+timeout_secs: 30
+
+# Maximum number of concurrent requests
+max_concurrent_requests: 10
+
+# Delay between requests in milliseconds (0 = no delay)
+delay_ms: 100
+
+# Maximum number of retries per request
+max_retries: 3
+
+# Follow HTTP redirects
+follow_redirects: true
+
+# Respect robots.txt rules
+respect_robots_txt: true
+
+# URL patterns to include (regex, optional)
+include_patterns: []
+
+# URL patterns to exclude (regex, optional)
+exclude_patterns:
+  - "\\.pdf$"
+  - "\\.zip$"
+  - "\\.exe$"
+
+# CSS selectors to extract specific content (optional)
+css_selectors: []
+
+# Custom HTTP headers (optional)
+headers: {}
+
+# User agent string (optional)
+# user_agent: "Mozilla/5.0 (compatible; Crawlery/1.0)"
+
+# Proxy configuration (optional)
+# proxy:
+#   url: "http://proxy.example.com:8080"
+#   username: null
+#   password: null
