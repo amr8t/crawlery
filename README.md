@@ -17,21 +17,37 @@ A fast, RAG-optimized web crawler built in Rust. Extracts clean content from web
 
 ## Quick Start
 
-### CLI Usage
-
 ```bash
 # Install
 cargo install --path .
 
-# Basic crawl with CLI arguments
-crawlery https://example.com -m http -d 2 -o results.json
+# Quick crawl with defaults (depth=2, max_pages=50)
+crawlery https://example.com
 
-# Use a recipe file (recommended)
-crawlery --recipe examples/recipes/basic_crawl.yaml -v
+# Use a recipe file (recommended for full control)
+crawlery --recipe examples/recipes/basic_crawl.yaml
 
 # Resume an interrupted crawl
-crawlery --recipe examples/recipes/resumable_crawl.yaml --resume
+crawlery --recipe my_recipe.yaml --resume
+
+# Override output path
+crawlery --recipe my_recipe.yaml -o custom_output.json
 ```
+
+### CLI Options
+
+```
+Usage: crawlery [OPTIONS] [URL]
+
+Options:
+  -r, --recipe <FILE>  Recipe file (YAML config)
+      --resume         Resume from existing state
+  -o, --output <PATH>  Override output path
+  -v, --verbose        Verbose output
+  -h, --help           Show help
+```
+
+For advanced configuration, use recipe files (see `examples/recipes/`).
 
 ### Library Usage
 
@@ -75,9 +91,9 @@ let markdown = extract_content(html)?;  // Returns: "# Title\n\nContent\n"
 
 ## Recipe Files
 
-Recipe files are YAML configuration files that define all crawl settings in one place, making crawls reproducible and easy to share.
+Recipe files define all crawl settings in YAML format for reproducible crawls.
 
-### Creating a Recipe
+### Example Recipe
 
 ```yaml
 url: "https://example.com"
@@ -86,33 +102,21 @@ max_depth: 3
 max_pages: 100
 output_path: "results.json"
 output_format: json-pretty
-state_file: "crawl.state"  # Enable resumable crawling
-timeout_secs: 30
-delay_ms: 500
-respect_robots_txt: true
+state_file: "crawl.state"
 
 include_patterns:
-  - "^https://example\\.com/docs/.*"
+  - "^https://example\\.com/docs/"
 exclude_patterns:
   - "\\.pdf$"
-  - "/login"
 ```
 
-### Using Recipes
+See `examples/recipes/` for templates:
+- `basic_crawl.yaml` - General purpose
+- `documentation_crawl.yaml` - Docs with URL filtering
 
-```bash
-# Run a crawl with a recipe
-crawlery --recipe my_recipe.yaml -v
-
-# Override output path
-crawlery --recipe my_recipe.yaml --output custom_output.json
-
-# Create a recipe programmatically
-```
+### Create Recipe from Code
 
 ```rust
-use crawlery::CrawlConfig;
-
 let config = CrawlConfig::builder()
     .url("https://example.com")
     .max_depth(3)
@@ -120,12 +124,6 @@ let config = CrawlConfig::builder()
 
 config.to_file("my_recipe.yaml")?;
 ```
-
-See `examples/recipes/` for ready-to-use recipe templates:
-- `basic_crawl.yaml` - Simple general-purpose crawl
-- `documentation_crawl.yaml` - Optimized for docs with URL filtering
-- `resumable_crawl.yaml` - Long-running resumable crawl
-- `browser_crawl.yaml` - JavaScript-heavy sites
 
 ## Resumable Crawling
 
@@ -171,8 +169,6 @@ Perfect for:
 ## Documentation
 
 Full API documentation: `cargo doc --open`
-
-Recipe file documentation: See `examples/recipes/README.md`
 
 ## License
 
