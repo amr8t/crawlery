@@ -52,7 +52,7 @@ fn test_crawl_config_builder_full() {
         .respect_robots_txt(false)
         .include_pattern(r"^https://example\.com/blog/")
         .exclude_pattern(r"\.pdf$")
-        .css_selector("article")
+        .extract_content(true)
         .header("Accept", "application/json")
         .build()
         .expect("Failed to build config");
@@ -72,7 +72,7 @@ fn test_crawl_config_builder_full() {
     assert!(!config.respect_robots_txt);
     assert_eq!(config.include_patterns.len(), 1);
     assert_eq!(config.exclude_patterns.len(), 1);
-    assert_eq!(config.css_selectors.len(), 1);
+    assert_eq!(config.extract_content, true);
     assert_eq!(config.headers.len(), 1);
 }
 
@@ -130,13 +130,19 @@ fn test_crawl_config_multiple_patterns() {
 fn test_crawl_config_multiple_selectors() {
     let config = CrawlConfig::builder()
         .url("https://example.com")
-        .css_selector("article")
-        .css_selector("div.content")
-        .css_selector("main")
+        .extract_content(true)
         .build()
         .expect("Failed to build config");
 
-    assert_eq!(config.css_selectors.len(), 3);
+    assert_eq!(config.extract_content, true);
+
+    // Test that default is false
+    let config_default = CrawlConfig::builder()
+        .url("https://example.com")
+        .build()
+        .expect("Failed to build config");
+
+    assert_eq!(config_default.extract_content, false);
 }
 
 #[test]
@@ -479,7 +485,7 @@ fn test_builder_chaining_complex_config() {
         .url("https://example.com")
         .exclude_pattern(r"\.pdf$")
         .mode(CrawlMode::Http)
-        .css_selector("article")
+        .extract_content(false)
         .max_depth(3)
         .header("Accept", "text/html")
         .timeout_secs(45)
@@ -492,7 +498,7 @@ fn test_builder_chaining_complex_config() {
     assert_eq!(config.max_depth, 3);
     assert_eq!(config.include_patterns.len(), 1);
     assert_eq!(config.exclude_patterns.len(), 1);
-    assert_eq!(config.css_selectors.len(), 1);
+    assert_eq!(config.extract_content, false);
     assert_eq!(config.headers.len(), 1);
 }
 

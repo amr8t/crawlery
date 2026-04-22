@@ -32,5 +32,8 @@ exclude_patterns:
   - "/blog/"
   - "\\?utm_"
 
-css_selectors: []
+# Extract clean content using readability algorithm (for RAG/LLM applications)
+# Set to true for clean markdown-like content, false for raw HTML
+# Documentation sites benefit from clean extraction for better RAG results
+extract_content: true
 headers: {}

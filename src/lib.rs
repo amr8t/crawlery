@@ -125,12 +125,18 @@ impl Crawler {
         self.crawl_loop(state, |url| {
             let url_owned = url.to_string();
             let crawler = crawler.clone();
+            let extract = self.config.extract_content;
             async move {
                 let result = crawler.fetch(&url_owned).await?;
+                let content = if extract {
+                    result.clean_text
+                } else {
+                    result.html.clone()
+                };
                 Ok((
                     result.status_code,
                     result.html.clone(),
-                    result.clean_text,
+                    content,
                     result.links,
                 ))
             }
@@ -151,12 +157,18 @@ impl Crawler {
         self.crawl_loop(state, |url| {
             let url_owned = url.to_string();
             let crawler = crawler.clone();
+            let extract = self.config.extract_content;
             async move {
                 let result = crawler.fetch(&url_owned)?;
+                let content = if extract {
+                    result.cleaned_content
+                } else {
+                    result.html.clone()
+                };
                 Ok((
                     result.status_code.unwrap_or(200),
                     result.html.clone(),
-                    result.cleaned_content,
+                    content,
                     result.links,
                 ))
             }
@@ -449,8 +461,9 @@ pub struct CrawlConfig {
     /// URL patterns to exclude (regex)
     pub exclude_patterns: Vec<String>,
 
-    /// Extract only specific CSS selectors
-    pub css_selectors: Vec<String>,
+    /// Extract clean content using readability algorithm (for RAG/LLM applications)
+    /// If false, returns raw HTML content. Default: false
+    pub extract_content: bool,
 
     /// Additional HTTP headers
     pub headers: HashMap<String, String>,
@@ -601,7 +614,7 @@ pub struct CrawlConfigBuilder {
     respect_robots_txt: Option<bool>,
     include_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
-    css_selectors: Vec<String>,
+    extract_content: bool,
     headers: HashMap<String, String>,
 }
 
@@ -708,9 +721,11 @@ impl CrawlConfigBuilder {
         self
     }
 
-    /// Adds a CSS selector to extract.
-    pub fn css_selector(mut self, selector: impl Into<String>) -> Self {
-        self.css_selectors.push(selector.into());
+    /// Enables content extraction using readability algorithm.
+    /// When enabled, returns clean markdown-like content optimized for RAG/LLM.
+    /// When disabled (default), returns raw HTML content.
+    pub fn extract_content(mut self, extract: bool) -> Self {
+        self.extract_content = extract;
         self
     }
 
@@ -748,7 +763,7 @@ impl CrawlConfigBuilder {
             respect_robots_txt: self.respect_robots_txt.unwrap_or(true),
             include_patterns: self.include_patterns,
             exclude_patterns: self.exclude_patterns,
-            css_selectors: self.css_selectors,
+            extract_content: self.extract_content,
             headers: self.headers,
         };
 
@@ -1107,7 +1122,7 @@ mod tests {
             .include_pattern(r"^https://docs\.example\.com/.*")
             .exclude_pattern(r"\.pdf$")
             .exclude_pattern(r"/login")
-            .css_selector("article")
+            .extract_content(true)
             .header("User-Agent".to_string(), "TestBot/1.0".to_string())
             .build()
             .unwrap();
@@ -1144,7 +1159,10 @@ mod tests {
             loaded_config.exclude_patterns,
             original_config.exclude_patterns
         );
-        assert_eq!(loaded_config.css_selectors, original_config.css_selectors);
+        assert_eq!(
+            loaded_config.extract_content,
+            original_config.extract_content
+        );
         assert_eq!(loaded_config.headers, original_config.headers);
     }
 
@@ -1186,7 +1204,7 @@ follow_redirects: true
 respect_robots_txt: true
 include_patterns: []
 exclude_patterns: []
-css_selectors: []
+extract_content: false
 headers: {}
 "#;
         fs::write(file_path, yaml).unwrap();

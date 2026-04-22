@@ -51,8 +51,7 @@ fn example_create_recipe() -> Result<()> {
         .include_pattern(r"^https://example\.com/.*")
         .exclude_pattern(r"\.pdf$")
         .exclude_pattern(r"\.zip$")
-        .css_selector("article")
-        .css_selector("main")
+        .extract_content(true) // Enable clean content extraction for RAG/LLM
         .header("User-Agent".to_string(), "Crawlery Example/1.0".to_string())
         .build()?;
 

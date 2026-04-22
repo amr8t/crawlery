@@ -167,9 +167,8 @@ async fn advanced_crawl() -> anyhow::Result<()> {
         // Add custom headers
         .header("Accept-Language", "en-US,en;q=0.9")
         .header("Accept", "text/html,application/xhtml+xml")
-        // Extract specific CSS selectors
-        .css_selector("article")
-        .css_selector("main")
+        // Extract clean content for RAG/LLM applications
+        .extract_content(true)
         // Output configuration
         .output_format(OutputFormat::JsonPretty)
         .output_path("/tmp/crawl_results.json")

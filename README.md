@@ -1,12 +1,12 @@
 # Crawlery
 
-A fast, RAG-optimized web crawler built in Rust. Extracts clean content from web pages using readability-style algorithms, perfect for LLM/RAG applications.
+A fast, efficient and customizable web crawler built in Rust. Extracts clean content from web pages using readability-style algorithms, perfect for LLM/RAG applications.
 
 ## Features
 
 - 🚀 Dual crawling modes: HTTP (fast) & headless Chrome (JavaScript support)
-- 🧠 Intelligent content extraction: Removes navigation, ads, footers while preserving main content
-- 📝 Clean Markdown output: Optimized for LLM ingestion with proper structure
+- 🧠 Optional content extraction: Enable readability-style cleaning for RAG/LLM applications
+- 📝 Flexible output: Raw HTML (default) or clean Markdown for LLM ingestion
 - 🏷️ Metadata extraction: Title, author, date, description from OpenGraph/Schema.org
 - 🔄 Resumable crawling: State persistence for interrupted crawls with automatic resume
 - 📋 Recipe files: YAML-based configuration for reproducible crawls
@@ -75,18 +75,40 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Content Extraction for RAG
+## Content Extraction Options
 
-Crawlery uses readability algorithms to extract clean content perfect for RAG pipelines:
+Crawlery provides two output modes:
+
+### 1. Raw HTML (Default)
+By default, Crawlery returns the raw HTML content, just like traditional scrapers. This gives you the complete page structure to process yourself.
+
+### 2. Clean Content Extraction (Optional - for RAG/LLM)
+Enable `extract_content: true` to use readability algorithms that extract clean content perfect for RAG pipelines:
 
 ```rust
-use crawlery::content::extract_content;
+use crawlery::{CrawlConfig, CrawlMode, Crawler};
 
-let html = "<article><h1>Title</h1><p>Content</p></article>";
-let markdown = extract_content(html)?;  // Returns: "# Title\n\nContent\n"
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let config = CrawlConfig::builder()
+        .url("https://example.com")
+        .extract_content(true)  // Enable clean content extraction
+        .build()?;
+
+    let crawler = Crawler::new(config);
+    let results = crawler.crawl().await?;
+    // Results contain cleaned markdown-like content
+    Ok(())
+}
 ```
 
-**Removes**: Navigation, ads, footers, sidebars, scripts, cookie banners  
+Or in a recipe file:
+```yaml
+url: "https://example.com"
+extract_content: true  # Enable for RAG/LLM applications
+```
+
+**When enabled, removes**: Navigation, ads, footers, sidebars, scripts, cookie banners  
 **Preserves**: Main content, headings, lists, quotes, document structure
 
 ## Recipe Files
@@ -103,6 +125,9 @@ max_pages: 100
 output_path: "results.json"
 output_format: json-pretty
 state_file: "crawl.state"
+
+# Content extraction (optional)
+extract_content: false  # false = raw HTML (default), true = clean content for RAG/LLM
 
 include_patterns:
   - "^https://example\\.com/docs/"

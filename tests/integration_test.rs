@@ -287,16 +287,23 @@ async fn test_header_configuration() {
 }
 
 #[test]
-fn test_css_selector_configuration() {
+fn test_extract_content_configuration() {
+    // Default should be false (raw HTML)
     let config = CrawlConfig::builder()
         .url("https://example.com")
         .mode(CrawlMode::Http)
-        .css_selector("article")
-        .css_selector("main")
         .build()
         .unwrap();
 
-    assert_eq!(config.css_selectors.len(), 2);
-    assert!(config.css_selectors.contains(&"article".to_string()));
-    assert!(config.css_selectors.contains(&"main".to_string()));
+    assert_eq!(config.extract_content, false);
+
+    // When enabled, should extract clean content
+    let config_with_extraction = CrawlConfig::builder()
+        .url("https://example.com")
+        .mode(CrawlMode::Http)
+        .extract_content(true)
+        .build()
+        .unwrap();
+
+    assert_eq!(config_with_extraction.extract_content, true);
 }
