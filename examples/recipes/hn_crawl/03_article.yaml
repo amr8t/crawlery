@@ -1,0 +1,17 @@
+name: hn_articles
+input_from: "out/hn_crawl/article_urls.json"
+mode: http
+max_depth: 0
+delay_ms: 800
+output_path: "out/hn_crawl/03_articles.json"
+output_format: json-pretty
+respect_robots_txt: true
+md_readability: true
+transformers:
+  - type: filter
+    condition:
+      expression: "status_code == 200"
+  - type: command
+    cmd: python3
+    args: ["examples/recipes/hn_crawl/clean_content.py"]
+    timeout_ms: 15000

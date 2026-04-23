@@ -26,6 +26,7 @@
 //!         timeout_secs: 30,
 //!         proxies: vec![],
 //!         respect_robots_txt: true,
+//!         ..HttpCrawlerConfig::default()
 //!     };
 //!
 //!     let crawler = HttpCrawler::new(config)?;
@@ -68,10 +69,11 @@ use crate::content;
 /// // Or customize the configuration
 /// let config = HttpCrawlerConfig {
 ///     user_agent: "MyBot/1.0".to_string(),
-///     delay_ms: 2000,  // 2 second delay between requests
+///     delay_ms: 2000,
 ///     timeout_secs: 60,
 ///     proxies: vec!["http://proxy.example.com:8080".to_string()],
 ///     respect_robots_txt: true,
+///     ..HttpCrawlerConfig::default()
 /// };
 /// ```
 #[derive(Clone)]
@@ -104,6 +106,12 @@ pub struct HttpCrawlerConfig {
     /// When `true`, the crawler fetches and parses robots.txt for each domain
     /// and skips URLs that are disallowed for the crawler's user agent.
     pub respect_robots_txt: bool,
+
+    /// Extra HTTP headers to inject (e.g. from a session file).
+    pub extra_headers: std::collections::HashMap<String, String>,
+
+    /// Cookies to inject into requests (name, value, domain).
+    pub initial_cookies: Vec<crate::session::SessionCookie>,
 }
 
 impl Default for HttpCrawlerConfig {
@@ -114,6 +122,8 @@ impl Default for HttpCrawlerConfig {
             timeout_secs: 30,
             proxies: vec![],
             respect_robots_txt: true,
+            extra_headers: std::collections::HashMap::new(),
+            initial_cookies: vec![],
         }
     }
 }
@@ -153,6 +163,7 @@ pub struct HttpCrawler {
     config: HttpCrawlerConfig,
     proxy_index: AtomicUsize,
     robots_cache: Arc<RwLock<HashMap<String, bool>>>,
+    collected_cookies: Arc<std::sync::Mutex<Vec<crate::session::SessionCookie>>>,
 }
 
 impl HttpCrawler {
@@ -182,17 +193,49 @@ impl HttpCrawler {
     pub fn new(config: HttpCrawlerConfig) -> Result<Self> {
         let mut builder = Client::builder()
             .user_agent(&config.user_agent)
-            .timeout(Duration::from_secs(config.timeout_secs));
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .cookie_store(true);
+
         if !config.proxies.is_empty() {
             if let Ok(proxy) = Proxy::all(&config.proxies[0]) {
                 builder = builder.proxy(proxy);
             }
         }
+
+        // Build default headers from extra_headers
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        for (k, v) in &config.extra_headers {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                default_headers.insert(name, value);
+            }
+        }
+
+        // Inject initial cookies as Cookie header
+        if !config.initial_cookies.is_empty() {
+            let cookie_str = config
+                .initial_cookies
+                .iter()
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&cookie_str) {
+                default_headers.insert(reqwest::header::COOKIE, value);
+            }
+        }
+
+        if !default_headers.is_empty() {
+            builder = builder.default_headers(default_headers);
+        }
+
         Ok(Self {
             client: builder.build()?,
             config,
             proxy_index: AtomicUsize::new(0),
             robots_cache: Arc::new(RwLock::new(HashMap::new())),
+            collected_cookies: Arc::new(std::sync::Mutex::new(vec![])),
         })
     }
 
@@ -244,10 +287,42 @@ impl HttpCrawler {
         }
         let response = self.client.get(url).send().await?;
         let status_code = response.status().as_u16();
+
+        // Capture Set-Cookie headers before consuming response body
+        {
+            let mut cookies = self.collected_cookies.lock().unwrap();
+            for header_value in response.headers().get_all(reqwest::header::SET_COOKIE) {
+                if let Ok(cookie_str) = header_value.to_str() {
+                    let parts: Vec<&str> = cookie_str.split(';').collect();
+                    if let Some(name_value) = parts.first() {
+                        let nv: Vec<&str> = name_value.splitn(2, '=').collect();
+                        if nv.len() == 2 {
+                            let name = nv[0].trim().to_string();
+                            let value = nv[1].trim().to_string();
+                            let domain = parts
+                                .iter()
+                                .find(|p| p.trim().to_lowercase().starts_with("domain="))
+                                .map(|p| p.trim()[7..].to_string());
+                            let path = parts
+                                .iter()
+                                .find(|p| p.trim().to_lowercase().starts_with("path="))
+                                .map(|p| p.trim()[5..].to_string());
+                            cookies.push(crate::session::SessionCookie {
+                                name,
+                                value,
+                                domain,
+                                path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let html = response.text().await?;
         let links = self.extract_links(&html, &parsed_url)?;
         let clean_text =
-            content::extract_content(&html).unwrap_or_else(|_| self.clean_content(&html));
+            content::md_readability(&html, url).unwrap_or_else(|_| self.clean_content(&html));
         Ok(CrawlResult {
             url: url.to_string(),
             html,
@@ -255,6 +330,16 @@ impl HttpCrawler {
             links,
             status_code,
         })
+    }
+
+    /// Collect session data (cookies captured during crawl).
+    pub fn collect_session(&self) -> crate::session::SessionData {
+        let cookies = self.collected_cookies.lock().unwrap().clone();
+        crate::session::SessionData {
+            cookies,
+            headers: std::collections::HashMap::new(),
+            saved_at: None,
+        }
     }
 
     /// Extracts and normalizes all links from HTML content.

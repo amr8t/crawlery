@@ -1,9 +1,5 @@
 //! Crawlery - A flexible web crawler with HTTP and browser automation support.
 //!
-//! This library provides a robust web crawling framework that supports both HTTP-based
-//! crawling and browser automation. It can be used as a library in your Rust projects
-//! or through the command-line interface.
-//!
 //! # Examples
 //!
 //! ```no_run
@@ -35,9 +31,12 @@ use url::Url;
 pub mod browser;
 pub mod content;
 pub mod error;
+pub mod hooks;
 pub mod http_client;
 pub mod output;
+pub mod session;
 pub mod state;
+pub mod transformers;
 
 pub use error::{CrawlError, ErrorContext, Result};
 
@@ -47,12 +46,39 @@ pub use scraper;
 pub use tokio;
 
 /// The main crawler struct that orchestrates the crawling process.
-///
-/// This is the primary entry point for using the library. Create a crawler
-/// with a configuration and call `crawl()` to start crawling.
 #[derive(Debug)]
 pub struct Crawler {
     config: CrawlConfig,
+}
+
+/// Load start URLs from an input_from file.
+/// Accepts `["url1","url2"]` or `[{"url":"...","title":"..."},...]` format.
+fn load_input_urls(path: &PathBuf) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path).map_err(|e| CrawlError::IoError {
+        path: path.to_string_lossy().to_string(),
+        message: e.to_string(),
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| CrawlError::ValidationError {
+            field: "input_from".to_string(),
+            message: format!("Failed to parse input file as JSON: {}", e),
+        })?;
+    let arr = value.as_array().ok_or_else(|| CrawlError::ValidationError {
+        field: "input_from".to_string(),
+        message: "Input file must be a JSON array".to_string(),
+    })?;
+    let mut urls = Vec::new();
+    for item in arr {
+        if let Some(s) = item.as_str() {
+            urls.push(s.to_string());
+        } else if let Some(u) = item.get("url").and_then(|v| v.as_str()) {
+            urls.push(u.to_string());
+        }
+    }
+    if urls.is_empty() {
+        anyhow::bail!("input_from file contains no valid URLs");
+    }
+    Ok(urls)
 }
 
 impl Crawler {
@@ -62,47 +88,84 @@ impl Crawler {
     }
 
     /// Starts the crawling process and returns the results.
-    ///
-    /// This is an async function that will crawl the target URL and all discovered
-    /// links up to the configured maximum depth.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the crawl fails due to network issues, invalid URLs,
-    /// or other errors during the crawling process.
     pub async fn crawl(&self) -> Result<Vec<CrawlResult>> {
-        // Create or load crawl state
+        // Load session data if configured
+        let session_data: Option<session::SessionData> = if let Some(sc) = &self.config.session {
+            if let Some(path) = &sc.load_from {
+                Some(session::SessionData::load(path)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Determine start URLs
+        let start_urls: Vec<String> = if let Some(input_path) = &self.config.input_from {
+            load_input_urls(input_path)?
+        } else {
+            vec![self.config.url.clone()]
+        };
+
+        // Create or resume crawl state
         let mut state = if let Some(state_file) = &self.config.state_file {
             if state_file.exists() {
                 eprintln!("Resuming from saved state: {:?}", state_file);
                 state::CrawlState::load(state_file)?
             } else {
-                Self::create_state(&self.config)
+                Self::create_state_with_urls(&self.config, &start_urls)
             }
         } else {
-            Self::create_state(&self.config)
+            Self::create_state_with_urls(&self.config, &start_urls)
         };
 
-        // Choose crawler based on mode
-        match self.config.mode {
-            CrawlMode::Http => self.crawl_with_http(&mut state).await,
-            CrawlMode::Browser => self.crawl_with_browser(&mut state).await,
+        // Run crawl
+        let mut results = match self.config.mode {
+            CrawlMode::Http => self.crawl_with_http(&mut state, session_data.as_ref()).await?,
+            CrawlMode::Browser => {
+                self.crawl_with_browser(&mut state, session_data.as_ref()).await?
+            }
+        };
+
+        // Apply transformers
+        if !self.config.transformers.is_empty() {
+            results =
+                transformers::apply_transformers(results, &self.config.transformers).await?;
         }
+
+        Ok(results)
     }
 
-    /// Create a new CrawlState from config
-    fn create_state(config: &CrawlConfig) -> state::CrawlState {
-        state::CrawlState::new(state::CrawlConfig {
-            start_url: config.url.clone(),
+    /// Create a new CrawlState from a list of start URLs.
+    fn create_state_with_urls(config: &CrawlConfig, urls: &[String]) -> state::CrawlState {
+        let first = urls.first().cloned().unwrap_or_else(|| config.url.clone());
+        let mut s = state::CrawlState::new(state::CrawlConfig {
+            start_url: first,
             max_depth: config.max_depth,
             max_pages: config.max_pages,
             respect_robots_txt: config.respect_robots_txt,
-        })
+        });
+        if urls.len() > 1 {
+            // seed_urls replaces the pending queue with ALL urls at depth 0
+            s.seed_urls(urls.to_vec());
+        }
+        s
     }
 
-    /// Crawl using HTTP client
-    async fn crawl_with_http(&self, state: &mut state::CrawlState) -> Result<Vec<CrawlResult>> {
-        // Create HTTP crawler
+    /// Crawl using HTTP client.
+    async fn crawl_with_http(
+        &self,
+        state: &mut state::CrawlState,
+        session: Option<&session::SessionData>,
+    ) -> Result<Vec<CrawlResult>> {
+        // Merge config headers with session headers
+        let mut extra_headers = self.config.headers.clone();
+        let mut initial_cookies = vec![];
+        if let Some(sd) = session {
+            extra_headers.extend(sd.headers.clone());
+            initial_cookies = sd.cookies.clone();
+        }
+
         let crawler = Arc::new(http_client::HttpCrawler::new(
             http_client::HttpCrawlerConfig {
                 user_agent: self
@@ -119,64 +182,119 @@ impl Crawler {
                     .map(|p| vec![p.url.clone()])
                     .unwrap_or_default(),
                 respect_robots_txt: self.config.respect_robots_txt,
+                extra_headers,
+                initial_cookies,
             },
         )?);
 
-        self.crawl_loop(state, |url| {
-            let url_owned = url.to_string();
-            let crawler = crawler.clone();
-            let extract = self.config.extract_content;
-            async move {
-                let result = crawler.fetch(&url_owned).await?;
-                let content = if extract {
-                    result.clean_text
-                } else {
-                    result.html.clone()
-                };
-                Ok((
-                    result.status_code,
-                    result.html.clone(),
-                    content,
-                    result.links,
-                ))
+        let config_session = self.config.session.clone();
+        let crawler_ref = crawler.clone();
+
+        let results = self
+            .crawl_loop(state, |url| {
+                let url_owned = url.to_string();
+                let crawler = crawler_ref.clone();
+                let extract = self.config.md_readability;
+                async move {
+                    let result = crawler.fetch(&url_owned).await?;
+                    let content = if extract {
+                        result.clean_text
+                    } else {
+                        result.html.clone()
+                    };
+                    Ok((result.status_code, result.html.clone(), content, result.links))
+                }
+            })
+            .await?;
+
+        // Save session after crawl if configured
+        if let Some(sc) = &config_session {
+            if let Some(save_to) = &sc.save_to {
+                let session_data = crawler.collect_session();
+                if sc.save_cookies && !session_data.cookies.is_empty() {
+                    session_data.save(save_to)?;
+                    eprintln!("Session saved to: {}", save_to.display());
+                }
             }
-        })
-        .await
+        }
+
+        Ok(results)
     }
 
-    /// Crawl using browser automation
-    async fn crawl_with_browser(&self, state: &mut state::CrawlState) -> Result<Vec<CrawlResult>> {
-        // Create browser crawler
+    /// Crawl using browser automation.
+    async fn crawl_with_browser(
+        &self,
+        state: &mut state::CrawlState,
+        session: Option<&session::SessionData>,
+    ) -> Result<Vec<CrawlResult>> {
+        // Build post_load JS hooks from HooksConfig
+        let post_load_js: Vec<(String, Option<u64>)> = self
+            .config
+            .hooks
+            .as_ref()
+            .map(|h| {
+                h.post_load
+                    .iter()
+                    .filter_map(|hook| {
+                        if let HookType::Javascript { source } = &hook.hook_type {
+                            Some((source.clone(), hook.timeout_ms))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let initial_cookies = session.map(|sd| sd.cookies.clone()).unwrap_or_default();
+
         let crawler = Arc::new(browser::BrowserCrawler::new(browser::BrowserConfig {
             proxy: self.config.proxy.as_ref().map(|p| p.url.clone()),
             user_agent: self.config.user_agent.clone(),
             timeout_secs: self.config.timeout_secs,
             headless: true,
+            post_load_js,
+            initial_cookies,
         })?);
 
-        self.crawl_loop(state, |url| {
-            let url_owned = url.to_string();
-            let crawler = crawler.clone();
-            let extract = self.config.extract_content;
-            async move {
-                let result = crawler.fetch(&url_owned)?;
-                let content = if extract {
-                    result.cleaned_content
-                } else {
-                    result.html.clone()
-                };
-                Ok((
-                    result.status_code.unwrap_or(200),
-                    result.html.clone(),
-                    content,
-                    result.links,
-                ))
+        let config_session = self.config.session.clone();
+        let crawler_ref = crawler.clone();
+
+        let results = self
+            .crawl_loop(state, |url| {
+                let url_owned = url.to_string();
+                let crawler = crawler_ref.clone();
+                let extract = self.config.md_readability;
+                async move {
+                    let result = crawler.fetch(&url_owned)?;
+                    let content = if extract {
+                        result.cleaned_content
+                    } else {
+                        result.html.clone()
+                    };
+                    Ok((
+                        result.status_code.unwrap_or(200),
+                        result.html.clone(),
+                        content,
+                        result.links,
+                    ))
+                }
+            })
+            .await?;
+
+        // Save session after crawl if configured
+        if let Some(sc) = &config_session {
+            if let Some(save_to) = &sc.save_to {
+                let session_data = crawler.collect_session();
+                session_data.save(save_to)?;
+                eprintln!("Browser session saved to: {}", save_to.display());
             }
-        })
-        .await
+        }
+
+        Ok(results)
     }
 
-    /// Main crawl loop - generic over HTTP and Browser crawlers
+    /// Main crawl loop - generic over HTTP and Browser crawlers.
     async fn crawl_loop<F, Fut>(
         &self,
         state: &mut state::CrawlState,
@@ -189,32 +307,35 @@ impl Crawler {
         let mut save_counter = 0;
         let mut error_count = 0;
 
-        // Crawl loop
         while let Some((url, depth)) = state.next_pending() {
-            // Skip if already visited
             if state.is_visited(&url) {
                 continue;
             }
-
-            // Check URL filters
             if !self.should_crawl_url(&url) {
                 continue;
             }
 
-            // Mark as visited
             state.mark_visited(url.clone());
+
+            // Run pre_request command hooks
+            if let Some(hooks_cfg) = &self.config.hooks {
+                if !hooks_cfg.pre_request.is_empty() {
+                    let mut env = std::collections::HashMap::new();
+                    env.insert("URL".to_string(), url.clone());
+                    if let Err(e) = hooks::run_hooks(&hooks_cfg.pre_request, &env).await {
+                        eprintln!("pre_request hook error for {}: {}", url, e);
+                    }
+                }
+            }
 
             eprintln!("Crawling [depth={}]: {}", depth, url);
 
-            // Fetch the page with retries
             let fetch_result = self.fetch_with_retry(&url, &fetch_fn).await;
 
             match fetch_result {
                 Ok((status_code, html, clean_text, links)) => {
-                    // Extract title from HTML
                     let title = Self::extract_title(&html);
 
-                    // Create state result
                     let state_result = state::CrawlResult {
                         url: url.clone(),
                         depth,
@@ -228,7 +349,6 @@ impl Crawler {
                             .as_secs(),
                     };
 
-                    // Filter and add discovered links to state
                     let filtered_links: Vec<String> = links
                         .into_iter()
                         .filter(|link| self.should_crawl_url(link))
@@ -237,13 +357,26 @@ impl Crawler {
                     state.add_pending(filtered_links, depth);
                     state.add_result(state_result);
 
-                    error_count = 0; // Reset error counter on success
+                    error_count = 0;
+
+                    // Run post_extract command hooks
+                    if let Some(hooks_cfg) = &self.config.hooks {
+                        if !hooks_cfg.post_extract.is_empty() {
+                            let mut env = std::collections::HashMap::new();
+                            env.insert("URL".to_string(), url.clone());
+                            env.insert("STATUS_CODE".to_string(), status_code.to_string());
+                            if let Err(e) =
+                                hooks::run_hooks(&hooks_cfg.post_extract, &env).await
+                            {
+                                eprintln!("post_extract hook error for {}: {}", url, e);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("Error fetching {}: {}", url, e);
                     error_count += 1;
 
-                    // Add error result to state
                     state.add_result(state::CrawlResult {
                         url: url.clone(),
                         depth,
@@ -257,7 +390,16 @@ impl Crawler {
                             .as_secs(),
                     });
 
-                    // Stop if too many consecutive errors
+                    // Run on_error hooks
+                    if let Some(hooks_cfg) = &self.config.hooks {
+                        if !hooks_cfg.on_error.is_empty() {
+                            let mut env = std::collections::HashMap::new();
+                            env.insert("URL".to_string(), url.clone());
+                            env.insert("ERROR".to_string(), e.to_string());
+                            let _ = hooks::run_hooks(&hooks_cfg.on_error, &env).await;
+                        }
+                    }
+
                     if error_count > 10 {
                         eprintln!("Too many consecutive errors, stopping crawl");
                         break;
@@ -265,7 +407,6 @@ impl Crawler {
                 }
             }
 
-            // Save state periodically (every 10 pages)
             save_counter += 1;
             if save_counter % 10 == 0 {
                 if let Some(state_file) = &self.config.state_file {
@@ -275,7 +416,6 @@ impl Crawler {
                 }
             }
 
-            // Progress update
             if state.result_count().is_multiple_of(10) {
                 eprintln!(
                     "Progress: {} pages crawled, {} pending",
@@ -285,7 +425,6 @@ impl Crawler {
             }
         }
 
-        // Final save
         if let Some(state_file) = &self.config.state_file {
             state.save(state_file)?;
         }
@@ -296,7 +435,6 @@ impl Crawler {
             state.elapsed_seconds()
         );
 
-        // Convert state results to lib.rs CrawlResult format
         Ok(state
             .results()
             .iter()
@@ -304,7 +442,7 @@ impl Crawler {
             .collect())
     }
 
-    /// Fetch with retry logic
+    /// Fetch with retry logic.
     async fn fetch_with_retry<F, Fut>(
         &self,
         url: &str,
@@ -340,9 +478,8 @@ impl Crawler {
         Err(last_error.unwrap())
     }
 
-    /// Check if URL should be crawled based on include/exclude patterns
+    /// Check if URL should be crawled based on include/exclude patterns.
     fn should_crawl_url(&self, url: &str) -> bool {
-        // Check include patterns
         if !self.config.include_patterns.is_empty() {
             let matches_include = self.config.include_patterns.iter().any(|pattern| {
                 regex::Regex::new(pattern)
@@ -354,7 +491,6 @@ impl Crawler {
             }
         }
 
-        // Check exclude patterns
         if !self.config.exclude_patterns.is_empty() {
             let matches_exclude = self.config.exclude_patterns.iter().any(|pattern| {
                 regex::Regex::new(pattern)
@@ -369,7 +505,7 @@ impl Crawler {
         true
     }
 
-    /// Extract title from HTML
+    /// Extract title from HTML.
     fn extract_title(html: &str) -> Option<String> {
         use scraper::{Html, Selector};
         let document = Html::parse_document(html);
@@ -380,7 +516,7 @@ impl Crawler {
             .map(|el| el.text().collect::<String>().trim().to_string())
     }
 
-    /// Convert state::CrawlResult to lib.rs CrawlResult
+    /// Convert state::CrawlResult to lib.rs CrawlResult.
     fn convert_state_result(state_result: &state::CrawlResult) -> CrawlResult {
         CrawlResult {
             url: state_result.url.clone(),
@@ -404,69 +540,115 @@ impl Crawler {
     }
 }
 
+fn default_crawl_mode() -> CrawlMode { CrawlMode::Http }
+fn default_max_depth() -> usize { 3 }
+fn default_timeout_secs() -> u64 { 30 }
+fn default_max_concurrent_requests() -> usize { 10 }
+fn default_max_retries() -> usize { 3 }
+fn default_output_format() -> OutputFormat { OutputFormat::Json }
+
 /// Configuration for the web crawler.
-///
-/// This struct contains all the settings needed to configure the crawler's behavior,
-/// including the target URL, crawl mode, depth limits, and output settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlConfig {
-    /// The starting URL to crawl
+    /// The starting URL to crawl.
+    #[serde(default)]
     pub url: String,
 
-    /// The crawling mode (HTTP or Browser)
+    /// The crawling mode (HTTP or Browser).
+    #[serde(default = "default_crawl_mode")]
     pub mode: CrawlMode,
 
-    /// Maximum depth to crawl (0 = only start URL)
+    /// Maximum depth to crawl (0 = only start URL).
+    #[serde(default = "default_max_depth")]
     pub max_depth: usize,
 
-    /// Maximum number of pages to crawl
+    /// Maximum number of pages to crawl.
+    #[serde(default)]
     pub max_pages: Option<usize>,
 
-    /// Optional path to save output
+    /// Optional path to save output.
+    #[serde(default)]
     pub output_path: Option<PathBuf>,
 
-    /// Optional path to save/load crawl state for resumability
+    /// Optional path to save/load crawl state for resumability.
+    #[serde(default)]
     pub state_file: Option<PathBuf>,
 
-    /// Output format for results
+    /// Output format for results.
+    #[serde(default = "default_output_format")]
     pub output_format: OutputFormat,
 
-    /// Proxy settings
+    /// Proxy settings.
+    #[serde(default)]
     pub proxy: Option<ProxyConfig>,
 
-    /// User agent string
+    /// User agent string.
+    #[serde(default)]
     pub user_agent: Option<String>,
 
-    /// Request timeout in seconds
+    /// Request timeout in seconds.
+    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 
-    /// Maximum number of concurrent requests
+    /// Maximum number of concurrent requests.
+    #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
-    /// Delay between requests in milliseconds
+    /// Delay between requests in milliseconds.
+    #[serde(default)]
     pub delay_ms: u64,
 
-    /// Maximum number of retries per request
+    /// Maximum number of retries per request.
+    #[serde(default = "default_max_retries")]
     pub max_retries: usize,
 
-    /// Follow redirects
+    /// Follow redirects.
+    #[serde(default = "default_true")]
     pub follow_redirects: bool,
 
-    /// Respect robots.txt
+    /// Respect robots.txt.
+    #[serde(default = "default_true")]
     pub respect_robots_txt: bool,
 
-    /// URL patterns to include (regex)
+    /// URL patterns to include (regex).
+    #[serde(default)]
     pub include_patterns: Vec<String>,
 
-    /// URL patterns to exclude (regex)
+    /// URL patterns to exclude (regex).
+    #[serde(default)]
     pub exclude_patterns: Vec<String>,
 
-    /// Extract clean content using readability algorithm (for RAG/LLM applications)
-    /// If false, returns raw HTML content. Default: false
-    pub extract_content: bool,
+    /// Extract clean content using readability algorithm.
+    #[serde(default)]
+    pub md_readability: bool,
 
-    /// Additional HTTP headers
+    /// Additional HTTP headers.
+    #[serde(default)]
     pub headers: HashMap<String, String>,
+
+    /// Optional stage name (for pipeline display).
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Load start URLs from a previous stage's output file.
+    #[serde(default)]
+    pub input_from: Option<PathBuf>,
+
+    /// Restrict JSON output to these top-level fields.
+    #[serde(default)]
+    pub extract_fields: Vec<String>,
+
+    /// Transformers applied after crawl and before output.
+    #[serde(default)]
+    pub transformers: Vec<Transformer>,
+
+    /// Lifecycle hooks.
+    #[serde(default)]
+    pub hooks: Option<HooksConfig>,
+
+    /// Session management (load/save cookies and headers).
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
 }
 
 impl CrawlConfig {
@@ -476,16 +658,19 @@ impl CrawlConfig {
     }
 
     /// Validates the configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the configuration is invalid (e.g., invalid URL format).
     pub fn validate(&self) -> Result<()> {
-        // Validate URL
-        Url::parse(&self.url).map_err(|e| CrawlError::InvalidUrl {
-            url: self.url.clone(),
-            reason: e.to_string(),
-        })?;
+        // Validate URL -- required unless input_from provides URLs
+        if !self.url.is_empty() {
+            Url::parse(&self.url).map_err(|e| CrawlError::InvalidUrl {
+                url: self.url.clone(),
+                reason: e.to_string(),
+            })?;
+        } else if self.input_from.is_none() {
+            return Err(CrawlError::ConfigError {
+                message: "Either 'url' or 'input_from' must be set".to_string(),
+            }
+            .into());
+        }
 
         // Validate patterns
         for pattern in &self.include_patterns {
@@ -506,32 +691,6 @@ impl CrawlConfig {
     }
 
     /// Loads a configuration from a YAML recipe file.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the YAML recipe file
-    ///
-    /// # Returns
-    ///
-    /// Returns the deserialized `CrawlConfig` from the file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The file cannot be read
-    /// - The YAML is invalid or doesn't match the expected format
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use crawlery::CrawlConfig;
-    ///
-    /// # fn main() -> anyhow::Result<()> {
-    /// let config = CrawlConfig::from_file("recipe.yaml")?;
-    /// println!("Loaded config for URL: {}", config.url);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref()).map_err(|e| CrawlError::IoError {
             path: path.as_ref().to_string_lossy().to_string(),
@@ -544,41 +703,11 @@ impl CrawlConfig {
                 message: format!("Failed to parse YAML recipe file: {}", e),
             })?;
 
-        // Validate the loaded configuration
         config.validate()?;
-
         Ok(config)
     }
 
     /// Saves the current configuration to a YAML recipe file.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path where the recipe file should be written
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The configuration cannot be serialized to YAML
-    /// - The file cannot be created or written
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use crawlery::{CrawlConfig, CrawlMode};
-    ///
-    /// # fn main() -> anyhow::Result<()> {
-    /// let config = CrawlConfig::builder()
-    ///     .url("https://example.com")
-    ///     .mode(CrawlMode::Http)
-    ///     .max_depth(3)
-    ///     .build()?;
-    ///
-    /// config.to_file("my_recipe.yaml")?;
-    /// println!("Recipe saved successfully");
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn to_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
         let yaml = serde_yaml::to_string(self).map_err(|e| CrawlError::ValidationError {
             field: "config".to_string(),
@@ -591,6 +720,21 @@ impl CrawlConfig {
         })?;
 
         Ok(())
+    }
+
+    /// Parse a multi-document YAML pipeline file (documents separated by `---`).
+    pub fn parse_pipeline(content: &str) -> Result<Vec<Self>> {
+        let mut configs = Vec::new();
+        for doc in serde_yaml::Deserializer::from_str(content) {
+            let config: CrawlConfig =
+                serde::Deserialize::deserialize(doc).map_err(|e| CrawlError::ValidationError {
+                    field: "pipeline".to_string(),
+                    message: format!("Failed to parse pipeline stage: {}", e),
+                })?;
+            config.validate()?;
+            configs.push(config);
+        }
+        Ok(configs)
     }
 }
 
@@ -614,136 +758,155 @@ pub struct CrawlConfigBuilder {
     respect_robots_txt: Option<bool>,
     include_patterns: Vec<String>,
     exclude_patterns: Vec<String>,
-    extract_content: bool,
+    md_readability: bool,
     headers: HashMap<String, String>,
+    name: Option<String>,
+    input_from: Option<PathBuf>,
+    extract_fields: Vec<String>,
+    transformers: Vec<Transformer>,
+    hooks: Option<HooksConfig>,
+    session: Option<SessionConfig>,
 }
 
 impl CrawlConfigBuilder {
-    /// Sets the starting URL to crawl.
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
         self
     }
 
-    /// Sets the crawl mode.
     pub fn mode(mut self, mode: CrawlMode) -> Self {
         self.mode = Some(mode);
         self
     }
 
-    /// Sets the maximum crawl depth.
     pub fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = Some(depth);
         self
     }
 
-    /// Sets the maximum number of pages to crawl.
     pub fn max_pages(mut self, pages: usize) -> Self {
         self.max_pages = Some(pages);
         self
     }
 
-    /// Sets the output path.
     pub fn output_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
         self
     }
 
-    /// Sets the state file path for resumable crawling.
     pub fn state_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.state_file = Some(path.into());
         self
     }
 
-    /// Sets the output format.
     pub fn output_format(mut self, format: OutputFormat) -> Self {
         self.output_format = Some(format);
         self
     }
 
-    /// Sets the proxy configuration.
     pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
         self
     }
 
-    /// Sets the user agent string.
     pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
         self.user_agent = Some(ua.into());
         self
     }
 
-    /// Sets the request timeout in seconds.
     pub fn timeout_secs(mut self, secs: u64) -> Self {
         self.timeout_secs = Some(secs);
         self
     }
 
-    /// Sets the maximum number of concurrent requests.
     pub fn max_concurrent_requests(mut self, max: usize) -> Self {
         self.max_concurrent_requests = Some(max);
         self
     }
 
-    /// Sets the delay between requests in milliseconds.
     pub fn delay_ms(mut self, ms: u64) -> Self {
         self.delay_ms = Some(ms);
         self
     }
 
-    /// Sets the maximum number of retries.
     pub fn max_retries(mut self, retries: usize) -> Self {
         self.max_retries = Some(retries);
         self
     }
 
-    /// Sets whether to follow redirects.
     pub fn follow_redirects(mut self, follow: bool) -> Self {
         self.follow_redirects = Some(follow);
         self
     }
 
-    /// Sets whether to respect robots.txt.
     pub fn respect_robots_txt(mut self, respect: bool) -> Self {
         self.respect_robots_txt = Some(respect);
         self
     }
 
-    /// Adds a URL include pattern (regex).
     pub fn include_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.include_patterns.push(pattern.into());
         self
     }
 
-    /// Adds a URL exclude pattern (regex).
     pub fn exclude_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.exclude_patterns.push(pattern.into());
         self
     }
 
-    /// Enables content extraction using readability algorithm.
-    /// When enabled, returns clean markdown-like content optimized for RAG/LLM.
-    /// When disabled (default), returns raw HTML content.
-    pub fn extract_content(mut self, extract: bool) -> Self {
-        self.extract_content = extract;
+    pub fn md_readability(mut self, extract: bool) -> Self {
+        self.md_readability = extract;
         self
     }
 
-    /// Adds an HTTP header.
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
 
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn input_from(mut self, path: impl Into<PathBuf>) -> Self {
+        self.input_from = Some(path.into());
+        self
+    }
+
+    pub fn extract_field(mut self, field: impl Into<String>) -> Self {
+        self.extract_fields.push(field.into());
+        self
+    }
+
+    pub fn transformer(mut self, t: Transformer) -> Self {
+        self.transformers.push(t);
+        self
+    }
+
+    pub fn hooks(mut self, hooks: HooksConfig) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    pub fn session(mut self, session: SessionConfig) -> Self {
+        self.session = Some(session);
+        self
+    }
+
     /// Builds the CrawlConfig, validating all settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if required fields are missing or invalid.
     pub fn build(self) -> Result<CrawlConfig> {
-        let url = self.url.ok_or_else(|| CrawlError::ConfigError {
-            message: "URL is required".to_string(),
-        })?;
+        let has_input_from = self.input_from.is_some();
+        let url = match self.url {
+            Some(u) => u,
+            None if has_input_from => String::new(),
+            None => {
+                return Err(CrawlError::ConfigError {
+                    message: "Either 'url' or 'input_from' must be set".to_string(),
+                }
+                .into())
+            }
+        };
 
         let config = CrawlConfig {
             url,
@@ -763,8 +926,14 @@ impl CrawlConfigBuilder {
             respect_robots_txt: self.respect_robots_txt.unwrap_or(true),
             include_patterns: self.include_patterns,
             exclude_patterns: self.exclude_patterns,
-            extract_content: self.extract_content,
+            md_readability: self.md_readability,
             headers: self.headers,
+            name: self.name,
+            input_from: self.input_from,
+            extract_fields: self.extract_fields,
+            transformers: self.transformers,
+            hooks: self.hooks,
+            session: self.session,
         };
 
         config.validate()?;
@@ -776,10 +945,7 @@ impl CrawlConfigBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CrawlMode {
-    /// Use HTTP client for fast, lightweight crawling
     Http,
-
-    /// Use headless browser for JavaScript-heavy sites
     Browser,
 }
 
@@ -810,42 +976,20 @@ impl std::str::FromStr for CrawlMode {
 /// Result of crawling a single URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrawlResult {
-    /// The URL that was crawled
     pub url: String,
-
-    /// HTTP status code
     pub status_code: Option<u16>,
-
-    /// The page title
     pub title: Option<String>,
-
-    /// The page content (HTML or text)
     pub content: String,
-
-    /// Links discovered on the page
     pub links: Vec<String>,
-
-    /// Metadata extracted from the page
     pub metadata: HashMap<String, String>,
-
-    /// Timestamp when the page was crawled
     pub timestamp: SystemTime,
-
-    /// Depth level in the crawl tree
     pub depth: usize,
-
-    /// Content type of the response
     pub content_type: Option<String>,
-
-    /// Response headers
     pub headers: HashMap<String, String>,
-
-    /// Any errors that occurred (non-fatal)
     pub errors: Vec<String>,
 }
 
 impl CrawlResult {
-    /// Creates a new CrawlResult with the minimum required fields.
     pub fn new(url: String, content: String, depth: usize) -> Self {
         Self {
             url,
@@ -862,12 +1006,10 @@ impl CrawlResult {
         }
     }
 
-    /// Returns the number of links found on this page.
     pub fn link_count(&self) -> usize {
         self.links.len()
     }
 
-    /// Checks if the crawl was successful (2xx status code).
     pub fn is_success(&self) -> bool {
         self.status_code
             .is_some_and(|code| (200..300).contains(&code))
@@ -878,20 +1020,11 @@ impl CrawlResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
-    /// JSON format
     Json,
-
-    /// JSON with pretty printing
     #[serde(alias = "json-pretty")]
     JsonPretty,
-
-    /// Markdown format
     Markdown,
-
-    /// CSV format
     Csv,
-
-    /// Plain text
     Text,
 }
 
@@ -931,18 +1064,12 @@ impl std::str::FromStr for OutputFormat {
 /// Proxy configuration for the crawler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
-    /// Proxy URL (e.g., "<http://proxy.example.com:8080>")
     pub url: String,
-
-    /// Optional username for proxy authentication
     pub username: Option<String>,
-
-    /// Optional password for proxy authentication
     pub password: Option<String>,
 }
 
 impl ProxyConfig {
-    /// Creates a new proxy configuration.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -951,12 +1078,84 @@ impl ProxyConfig {
         }
     }
 
-    /// Sets the authentication credentials.
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.username = Some(username.into());
         self.password = Some(password.into());
         self
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Session configuration for loading/saving cookies and headers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    pub load_from: Option<PathBuf>,
+    pub save_to: Option<PathBuf>,
+    #[serde(default = "default_true")]
+    pub save_cookies: bool,
+    #[serde(default = "default_true")]
+    pub save_headers: bool,
+}
+
+/// Lifecycle hook configuration (all fields default to empty).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    #[serde(default)]
+    pub pre_request: Vec<Hook>,
+    #[serde(default)]
+    pub post_load: Vec<Hook>,
+    #[serde(default)]
+    pub post_extract: Vec<Hook>,
+    #[serde(default)]
+    pub on_error: Vec<Hook>,
+}
+
+/// A single lifecycle hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hook {
+    #[serde(flatten)]
+    pub hook_type: HookType,
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub abort_on_error: bool,
+}
+
+/// The type of a hook -- shell command or JavaScript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HookType {
+    Command {
+        cmd: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    Javascript {
+        source: String,
+    },
+}
+
+/// Result transformer applied after crawl, before output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Transformer {
+    Filter { condition: FilterCondition },
+    Deduplicator { field: String },
+    ExtractFields { fields: Vec<String> },
+    Command {
+        cmd: String,
+        #[serde(default)]
+        args: Vec<String>,
+        timeout_ms: Option<u64>,
+    },
+}
+
+/// Condition expression for the Filter transformer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterCondition {
+    pub expression: String,
 }
 
 #[cfg(test)]
@@ -1122,7 +1321,7 @@ mod tests {
             .include_pattern(r"^https://docs\.example\.com/.*")
             .exclude_pattern(r"\.pdf$")
             .exclude_pattern(r"/login")
-            .extract_content(true)
+            .md_readability(true)
             .header("User-Agent".to_string(), "TestBot/1.0".to_string())
             .build()
             .unwrap();
@@ -1160,8 +1359,8 @@ mod tests {
             original_config.exclude_patterns
         );
         assert_eq!(
-            loaded_config.extract_content,
-            original_config.extract_content
+            loaded_config.md_readability,
+            original_config.md_readability
         );
         assert_eq!(loaded_config.headers, original_config.headers);
     }
@@ -1204,7 +1403,7 @@ follow_redirects: true
 respect_robots_txt: true
 include_patterns: []
 exclude_patterns: []
-extract_content: false
+md_readability: false
 headers: {}
 "#;
         fs::write(file_path, yaml).unwrap();

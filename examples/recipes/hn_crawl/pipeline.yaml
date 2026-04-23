@@ -1,0 +1,45 @@
+# Full pipeline: login then crawl HN pages 1 and 2.
+# Run with: crawlery --pipeline examples/recipes/hn_crawl/pipeline.yaml
+name: hn_login
+url: "https://news.ycombinator.com/login"
+mode: browser
+max_depth: 0
+max_pages: 1
+user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+output_path: "out/hn_crawl/01_login.json"
+output_format: json-pretty
+session:
+  save_to: "out/hn_crawl/session.json"
+  save_cookies: true
+hooks:
+  post_load:
+    - type: javascript
+      timeout_ms: 10000
+      source: |
+        async function() {
+          var acct = document.querySelector('input[name="acct"]');
+          var pw   = document.querySelector('input[name="pw"]');
+          if (acct && pw) {
+            acct.value = 'marty9x9';
+            pw.value   = 'tirmaoohas';
+            document.querySelector('form').submit();
+          }
+          await new Promise(r => setTimeout(r, 4000));
+        }
+---
+name: hn_crawl
+input_from: "examples/recipes/hn_crawl/hn_pages.json"
+mode: http
+max_depth: 0
+delay_ms: 500
+output_path: "out/hn_crawl/02_crawl.json"
+output_format: json-pretty
+session:
+  load_from: "out/hn_crawl/session.json"
+respect_robots_txt: false
+transformers:
+  - type: filter
+    condition:
+      expression: "status_code == 200"
+  - type: deduplicator
+    field: url

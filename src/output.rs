@@ -415,6 +415,13 @@ fn escape_csv(s: &str) -> String {
     s.replace('"', "\"\"")
 }
 
+
+/// Save projected (field-filtered) results as JSON.
+pub fn save_projected(values: &[serde_json::Value], path: Option<PathBuf>) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(values).context("Failed to serialize projected results")?;
+    write_output(&json, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

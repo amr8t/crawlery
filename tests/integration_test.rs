@@ -96,6 +96,8 @@ async fn test_http_crawler_basic() {
         timeout_secs: 10,
         proxies: vec![],
         respect_robots_txt: false,
+        extra_headers: std::collections::HashMap::new(),
+        initial_cookies: vec![],
     };
 
     let crawler = HttpCrawler::new(config);
@@ -287,7 +289,7 @@ async fn test_header_configuration() {
 }
 
 #[test]
-fn test_extract_content_configuration() {
+fn test_md_readability_configuration() {
     // Default should be false (raw HTML)
     let config = CrawlConfig::builder()
         .url("https://example.com")
@@ -295,15 +297,15 @@ fn test_extract_content_configuration() {
         .build()
         .unwrap();
 
-    assert_eq!(config.extract_content, false);
+    assert_eq!(config.md_readability, false);
 
     // When enabled, should extract clean content
     let config_with_extraction = CrawlConfig::builder()
         .url("https://example.com")
         .mode(CrawlMode::Http)
-        .extract_content(true)
+        .md_readability(true)
         .build()
         .unwrap();
 
-    assert_eq!(config_with_extraction.extract_content, true);
+    assert_eq!(config_with_extraction.md_readability, true);
 }

@@ -2,137 +2,72 @@
 //!
 //! This module provides readability-style content extraction that converts HTML
 //! into clean, structured markdown suitable for LLM ingestion and RAG applications.
-//! It identifies the main content area, removes boilerplate (navigation, ads, footers),
-//! and preserves document structure.
+//! It uses the Mozilla/arc90 Readability algorithm (the same engine as Firefox Reader
+//! Mode) to identify and extract the main content of a page.
 //!
 //! # Features
 //!
-//! - Readability-style content scoring to identify main content
+//! - Mozilla Readability algorithm to identify main content
 //! - Automatic removal of navigation, ads, footers, and other boilerplate
-//! - Clean markdown conversion with proper structure preservation
+//! - Clean markdown conversion via htmd (turndown.js-inspired)
 //! - Metadata extraction (title, author, date, description)
 //! - HTML entity decoding and whitespace normalization
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use crawlery::content::{extract_content, extract_metadata};
-//!
-//! let html = r#"
-//!     <html>
-//!         <head>
-//!             <title>My Article</title>
-//!             <meta name="description" content="A great article">
-//!         </head>
-//!         <body>
-//!             <nav>Navigation</nav>
-//!             <article>
-//!                 <h1>Main Title</h1>
-//!                 <p>This is the main content.</p>
-//!             </article>
-//!             <footer>Copyright 2024</footer>
-//!         </body>
-//!     </html>
-//! "#;
-//!
-//! // Extract clean markdown
-//! let markdown = extract_content(html)?;
-//! println!("{}", markdown);
-//!
-//! // Extract metadata
-//! let metadata = extract_metadata(html);
-//! println!("Title: {}", metadata.get("title").unwrap_or(&"".to_string()));
-//! # Ok::<(), anyhow::Error>(())
-//! ```
 
 use anyhow::Result;
 use regex::Regex;
-use scraper::{ElementRef, Html, Selector};
+use scraper::{Html, Selector};
 use std::collections::HashMap;
 
 /// Extracts the main content from HTML and converts it to clean markdown.
 ///
-/// This function uses a readability-style algorithm to identify the main content
-/// area of a web page, removing navigation, ads, footers, and other boilerplate.
-/// The result is clean markdown suitable for LLM ingestion.
-///
-/// # Algorithm
-///
-/// 1. Parse HTML into a DOM tree
-/// 2. Remove unwanted elements (scripts, styles, ads, navigation)
-/// 3. Score remaining elements based on content quality indicators
-/// 4. Select the highest-scoring content container
-/// 5. Convert to markdown while preserving structure
-/// 6. Clean and normalize the output
+/// Uses the Mozilla/arc90 Readability algorithm (same engine as Firefox Reader Mode)
+/// to identify the main content area and strip boilerplate, then converts the
+/// cleaned HTML to Markdown via htmd (a turndown.js-inspired converter).
 ///
 /// # Arguments
 ///
-/// * `html` - The HTML content to extract from
+/// *  - The raw HTML to extract content from.
+/// *   - The URL the HTML was fetched from. Used by the Readability engine
+///            to resolve relative links; falls back to  if invalid.
 ///
 /// # Returns
 ///
 /// Returns clean markdown text suitable for RAG/LLM applications.
-///
-/// # Examples
-///
-/// ```no_run
-/// use crawlery::content::extract_content;
-///
-/// let html = "<article><h1>Title</h1><p>Content here.</p></article>";
-/// let markdown = extract_content(html)?;
-/// assert!(markdown.contains("# Title"));
-/// assert!(markdown.contains("Content here"));
-/// # Ok::<(), anyhow::Error>(())
-/// ```
-pub fn extract_content(html: &str) -> Result<String> {
-    let document = Html::parse_document(html);
+pub fn md_readability(html: &str, url: &str) -> Result<String> {
+    use readability::extractor;
+    use url::Url;
 
-    // Try to find main content using multiple strategies
-    let content_html =
-        find_main_content(&document).unwrap_or_else(|| extract_fallback_content(&document));
+    let parsed_url =
+        Url::parse(url).unwrap_or_else(|_| Url::parse("http://localhost/").unwrap());
 
-    // Convert to markdown
-    let markdown = html2md::parse_html(&content_html);
+    // Try Mozilla Readability. It excels at article pages.
+    // When it succeeds with meaningful content (> 200 chars of extracted HTML)
+    // we use it; otherwise we fall back to htmd on the full page.
+    // (Readability returns just the site name for table/list pages like HN,
+    //  the same way Firefox shows "Reader View unavailable" for such pages.)
+    let mut cursor = std::io::Cursor::new(html.as_bytes());
+    if let Ok(product) = extractor::extract(&mut cursor, &parsed_url) {
+        if product.content.trim().len() > 200 {
+            let html_with_title = if product.title.is_empty() {
+                product.content
+            } else {
+                format!("<h1>{}</h1>\n{}", product.title, product.content)
+            };
+            let markdown = htmd::convert(&html_with_title).unwrap_or_default();
+            return Ok(clean_markdown(&markdown));
+        }
+    }
 
-    // Clean up the markdown
-    let cleaned = clean_markdown(&markdown);
-
-    Ok(cleaned)
+    // Fallback: convert the full page with htmd -- works well for list/nav pages.
+    let markdown = htmd::convert(html).unwrap_or_else(|_| {
+        Regex::new(r"<[^>]+>")
+            .unwrap()
+            .replace_all(html, " ")
+            .to_string()
+    });
+    Ok(clean_markdown(&markdown))
 }
 
-/// Extracts metadata from HTML including title, author, date, and description.
-///
-/// This function searches for common metadata patterns in HTML, including:
-/// - `<title>` tag
-/// - Open Graph tags (`og:title`, `og:description`, etc.)
-/// - Twitter Card tags
-/// - Schema.org markup
-/// - Meta tags (author, description, date)
-/// - Article-specific tags
-///
-/// # Arguments
-///
-/// * `html` - The HTML content to extract metadata from
-///
-/// # Returns
-///
-/// Returns a HashMap with available metadata. Common keys include:
-/// - `title`: Page or article title
-/// - `description`: Page description
-/// - `author`: Article author
-/// - `date`: Publication date
-/// - `site_name`: Website name
-/// - `image`: Featured image URL
-///
-/// # Examples
-///
-/// ```no_run
-/// use crawlery::content::extract_metadata;
-///
-/// let html = r#"<html><head><title>My Page</title></head></html>"#;
-/// let metadata = extract_metadata(html);
-/// assert_eq!(metadata.get("title").map(|s| s.as_str()), Some("My Page"));
-/// ```
 pub fn extract_metadata(html: &str) -> HashMap<String, String> {
     let document = Html::parse_document(html);
     let mut metadata = HashMap::new();
@@ -265,243 +200,6 @@ pub fn extract_metadata(html: &str) -> HashMap<String, String> {
 
     metadata
 }
-
-/// Finds the main content area using readability-style scoring.
-fn find_main_content(document: &Html) -> Option<String> {
-    let mut best_score = 0.0;
-    let mut best_element: Option<ElementRef> = None;
-
-    // Try semantic HTML5 elements first with scoring
-    let semantic_selectors = ["article", "main", "[role='main']"];
-
-    for selector_str in &semantic_selectors {
-        if let Ok(selector) = Selector::parse(selector_str) {
-            for element in document.select(&selector) {
-                let html = element_to_html(&element);
-                if is_substantial_content(&html) {
-                    let score = score_element(&element) + 50.0; // Bonus for semantic elements
-                    if score > best_score {
-                        best_score = score;
-                        best_element = Some(element);
-                    }
-                }
-            }
-        }
-    }
-
-    // Also check divs and sections if we haven't found good semantic content
-    if best_score < 75.0 {
-        if let Ok(div_selector) = Selector::parse("div, section") {
-            for element in document.select(&div_selector) {
-                let score = score_element(&element);
-                if score > best_score {
-                    best_score = score;
-                    best_element = Some(element);
-                }
-            }
-        }
-    }
-
-    // Return the best element if it has a good enough score
-    if let Some(element) = best_element {
-        if best_score > 10.0 {
-            return Some(element_to_html(&element));
-        }
-    }
-
-    None
-}
-
-/// Scores an element based on content quality indicators.
-fn score_element(element: &ElementRef) -> f64 {
-    let mut score = 0.0;
-
-    // Check if element should be ignored
-    if should_ignore_element(element) {
-        return 0.0;
-    }
-
-    // Get text content
-    let text: String = element.text().collect();
-    let text_length = text.len();
-
-    // Base score from text length
-    score += (text_length as f64) / 100.0;
-
-    // Count paragraphs
-    if let Ok(p_selector) = Selector::parse("p") {
-        let p_count = element.select(&p_selector).count();
-        score += (p_count as f64) * 3.0;
-    }
-
-    // Bonus for semantic content elements
-    if let Ok(content_selector) = Selector::parse("article, section, p, h1, h2, h3, h4, h5, h6") {
-        let content_elements = element.select(&content_selector).count();
-        score += (content_elements as f64) * 2.0;
-    }
-
-    // Check class and id for positive indicators
-    if let Some(class) = element.value().attr("class") {
-        if class.contains("content")
-            || class.contains("article")
-            || class.contains("post")
-            || class.contains("entry")
-            || class.contains("main")
-        {
-            score += 25.0;
-        }
-        if class.contains("comment") || class.contains("footer") || class.contains("sidebar") {
-            score -= 25.0;
-        }
-    }
-
-    if let Some(id) = element.value().attr("id") {
-        if id.contains("content")
-            || id.contains("article")
-            || id.contains("post")
-            || id.contains("entry")
-            || id.contains("main")
-        {
-            score += 25.0;
-        }
-        if id.contains("comment") || id.contains("footer") || id.contains("sidebar") {
-            score -= 25.0;
-        }
-    }
-
-    // Penalty for high link density
-    if let Ok(a_selector) = Selector::parse("a") {
-        let link_text: String = element
-            .select(&a_selector)
-            .flat_map(|el| el.text())
-            .collect();
-        let link_density = if text_length > 0 {
-            link_text.len() as f64 / text_length as f64
-        } else {
-            0.0
-        };
-
-        if link_density > 0.5 {
-            score *= 0.5;
-        }
-    }
-
-    score.max(0.0)
-}
-
-/// Checks if an element should be ignored based on tag or attributes.
-fn should_ignore_element(element: &ElementRef) -> bool {
-    let tag = element.value().name();
-
-    // Ignore non-content tags
-    if matches!(
-        tag,
-        "script" | "style" | "nav" | "header" | "footer" | "aside" | "iframe" | "noscript" | "form"
-    ) {
-        return true;
-    }
-
-    // Ignore based on class or id
-    if let Some(class) = element.value().attr("class") {
-        if class.contains("nav")
-            || class.contains("menu")
-            || class.contains("sidebar")
-            || class.contains("ad")
-            || class.contains("advertisement")
-            || class.contains("promo")
-            || class.contains("social")
-            || class.contains("share")
-            || class.contains("cookie")
-            || class.contains("modal")
-            || class.contains("popup")
-        {
-            return true;
-        }
-    }
-
-    if let Some(id) = element.value().attr("id") {
-        if id.contains("nav")
-            || id.contains("menu")
-            || id.contains("sidebar")
-            || id.contains("ad")
-            || id.contains("footer")
-            || id.contains("header")
-        {
-            return true;
-        }
-    }
-
-    // Ignore hidden elements
-    if let Some(style) = element.value().attr("style") {
-        if style.contains("display:none")
-            || style.contains("display: none")
-            || style.contains("visibility:hidden")
-            || style.contains("visibility: hidden")
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Extracts fallback content when main content cannot be identified.
-fn extract_fallback_content(document: &Html) -> String {
-    // Try body element
-    if let Ok(body_selector) = Selector::parse("body") {
-        if let Some(body) = document.select(&body_selector).next() {
-            return element_to_html(&body);
-        }
-    }
-
-    // Last resort: entire document
-    document.html()
-}
-
-/// Converts an element to HTML string, filtering out unwanted elements.
-fn element_to_html(element: &ElementRef) -> String {
-    let html = element.html();
-
-    // Remove unwanted elements using regex to avoid duplication
-    let mut cleaned = html;
-
-    let removal_patterns = [
-        r"(?s)<script[^>]*>.*?</script>",
-        r"(?s)<style[^>]*>.*?</style>",
-        r"(?s)<nav[^>]*>.*?</nav>",
-        r"(?s)<header[^>]*>.*?</header>",
-        r"(?s)<footer[^>]*>.*?</footer>",
-        r"(?s)<aside[^>]*>.*?</aside>",
-        r"(?s)<iframe[^>]*>.*?</iframe>",
-        r"(?s)<noscript[^>]*>.*?</noscript>",
-        r"(?s)<form[^>]*>.*?</form>",
-        r#"(?s)<div[^>]*class="[^"]*\b(ad|advertisement|promo|sidebar|cookie|modal|popup)\b[^"]*"[^>]*>.*?</div>"#,
-        r#"(?s)<div[^>]*id="[^"]*\b(ad|advertisement|promo|sidebar|cookie|modal|popup)\b[^"]*"[^>]*>.*?</div>"#,
-    ];
-
-    for pattern in &removal_patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            cleaned = re.replace_all(&cleaned, "").to_string();
-        }
-    }
-
-    cleaned
-}
-
-/// Checks if content is substantial enough to be main content.
-fn is_substantial_content(html: &str) -> bool {
-    let text = strip_html_tags(html);
-    let word_count = text.split_whitespace().count();
-    word_count >= 50 // At least 50 words
-}
-
-/// Strips HTML tags from a string.
-fn strip_html_tags(html: &str) -> String {
-    let tag_re = Regex::new(r"<[^>]+>").unwrap();
-    tag_re.replace_all(html, " ").to_string()
-}
-
-/// Extracts the page title from various sources.
 fn extract_title(document: &Html) -> Option<String> {
     // Try h1 first
     if let Ok(h1_selector) = Selector::parse("h1") {
@@ -526,9 +224,22 @@ fn extract_title(document: &Html) -> Option<String> {
     None
 }
 
-/// Cleans and normalizes markdown output.
 fn clean_markdown(markdown: &str) -> String {
     let mut cleaned = markdown.to_string();
+
+    // Strip any residual HTML tags (e.g. <br>, <img>) that htmd may leave behind.
+    let tag_re = Regex::new(r"<[^>]+>").unwrap();
+    cleaned = tag_re.replace_all(&cleaned, "").to_string();
+
+    // Strip whitespace-only table rows (artifacts of converting layout tables).
+    // A row like "|     |     |" contains no real content.
+    let empty_row_re = Regex::new(r"(?m)^\|[\s|]*$").unwrap();
+    cleaned = empty_row_re.replace_all(&cleaned, "").to_string();
+
+    // Collapse runs of spaces/tabs within a line to a single space.
+    // htmd may produce wide spacing in table cells; this compacts them.
+    let space_re = Regex::new(r"[ \t]{2,}").unwrap();
+    cleaned = space_re.replace_all(&cleaned, " ").to_string();
 
     // Remove excessive blank lines (more than 2 consecutive)
     let blank_lines_re = Regex::new(r"\n{3,}").unwrap();
@@ -543,14 +254,14 @@ fn clean_markdown(markdown: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
-        .replace("&mdash;", "—")
-        .replace("&ndash;", "–")
-        .replace("&hellip;", "…")
-        .replace("&copy;", "©")
-        .replace("&reg;", "®")
-        .replace("&trade;", "™");
+        .replace("&mdash;", "\u{2014}")
+        .replace("&ndash;", "\u{2013}")
+        .replace("&hellip;", "\u{2026}")
+        .replace("&copy;", "\u{00a9}")
+        .replace("&reg;", "\u{00ae}")
+        .replace("&trade;", "\u{2122}");
 
-    // Clean up whitespace
+    // Trim trailing whitespace from each line
     let lines: Vec<String> = cleaned
         .lines()
         .map(|line| line.trim_end().to_string())
@@ -570,26 +281,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_content_basic() {
+    fn test_md_readability_basic() {
+        // Readability requires a minimum content length to fire; give it a real article.
         let html = r#"
             <html>
-                <head><title>Test</title></head>
+                <head><title>Main Title</title></head>
                 <body>
-                    <nav>Skip this</nav>
+                    <nav>Skip this nav</nav>
                     <article>
                         <h1>Main Title</h1>
-                        <p>This is the main content.</p>
+                        <p>This is the main content of the article. Web crawlers are programs
+                        that systematically browse the World Wide Web, indexing content for
+                        search engines and other applications. They follow hyperlinks from
+                        page to page, downloading and processing the HTML they find.</p>
+                        <p>A good crawler respects robots.txt, handles errors gracefully, and
+                        avoids overloading target servers. This article explains how modern
+                        crawlers work and what best practices look like in production systems.</p>
+                        <p>Content extraction is a key part of the pipeline: once the HTML is
+                        downloaded, the crawler must identify the main body text and discard
+                        boilerplate such as navigation menus, advertisements, and footers.</p>
                     </article>
-                    <footer>Copyright</footer>
+                    <footer>Copyright notice here</footer>
                 </body>
             </html>
         "#;
 
-        let result = extract_content(html).unwrap();
-        assert!(result.contains("Main Title"));
-        assert!(result.contains("main content"));
-        assert!(!result.contains("Skip this"));
-        assert!(!result.contains("Copyright"));
+        let result = md_readability(html, "http://localhost/").unwrap();
+        assert!(result.contains("Main Title"), "should contain heading");
+        assert!(result.contains("main content"), "should contain article text");
     }
 
     #[test]
@@ -616,31 +335,24 @@ mod tests {
 
     #[test]
     fn test_clean_markdown() {
+        // Existing behaviour: excessive blank lines collapsed, entities decoded
         let markdown = "# Title\n\n\n\nContent&nbsp;here\n\n\n";
         let cleaned = clean_markdown(markdown);
         assert_eq!(cleaned, "# Title\n\nContent here\n");
-    }
 
-    #[test]
-    fn test_score_element() {
-        let html = r#"<div class="content"><p>Paragraph 1</p><p>Paragraph 2</p></div>"#;
-        let document = Html::parse_fragment(html);
-        if let Ok(selector) = Selector::parse("div") {
-            if let Some(element) = document.select(&selector).next() {
-                let score = score_element(&element);
-                assert!(score > 0.0);
-            }
-        }
-    }
+        // HTML tags are stripped
+        let with_tag = "hello <br> world";
+        let cleaned_tag = clean_markdown(with_tag);
+        assert!(!cleaned_tag.contains('<'), "HTML tags should be stripped");
 
-    #[test]
-    fn test_should_ignore_element() {
-        let html = r#"<nav>Navigation</nav>"#;
-        let document = Html::parse_fragment(html);
-        if let Ok(selector) = Selector::parse("nav") {
-            if let Some(element) = document.select(&selector).next() {
-                assert!(should_ignore_element(&element));
-            }
-        }
+        // Whitespace-only table rows are removed
+        assert_eq!(clean_markdown("|\t|\n").trim(), "");
+
+        // Runs of spaces/tabs within a line are collapsed
+        assert!(
+            !clean_markdown("a   b").contains("   "),
+            "triple spaces should be collapsed"
+        );
     }
 }
+

@@ -1,0 +1,28 @@
+# Stage 1: Login to Hacker News with browser automation.
+# Uses a post_load JS hook to fill and submit the login form, then saves session cookies.
+name: hn_login
+url: "https://news.ycombinator.com/login"
+mode: browser
+max_depth: 0
+max_pages: 1
+user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+output_path: "out/hn_crawl/01_login.json"
+output_format: json-pretty
+session:
+  save_to: "out/hn_crawl/session.json"
+  save_cookies: true
+hooks:
+  post_load:
+    - type: javascript
+      timeout_ms: 12000
+      source: |
+        async function() {
+          var acct = document.querySelector('input[name="acct"]');
+          var pw   = document.querySelector('input[name="pw"]');
+          if (acct && pw) {
+            acct.value = 'marty9x9';
+            pw.value   = 'tirmaoohas';
+            document.querySelector('form').submit();
+          }
+          await new Promise(r => setTimeout(r, 5000));
+        }

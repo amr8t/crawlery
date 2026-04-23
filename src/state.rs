@@ -295,6 +295,19 @@ impl CrawlState {
         }
     }
 
+
+    /// Replace the pending queue with a set of seed URLs at depth 0.
+    /// Used when `input_from` provides start URLs for a pipeline stage.
+    pub fn seed_urls(&mut self, urls: Vec<String>) {
+        self.pending.clear();
+        for url in urls {
+            let normalized = Self::normalize_url(&url);
+            if !self.is_visited(&normalized) {
+                self.pending.push_back(PendingUrl { url: normalized, depth: 0 });
+            }
+        }
+    }
+
     /// Loads crawl state from a JSON file for resumption.
     ///
     /// Deserializes a previously saved crawl state from a JSON file, allowing

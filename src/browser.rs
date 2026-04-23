@@ -29,6 +29,7 @@
 //!         user_agent: Some("MyBot/1.0".to_string()),
 //!         timeout_secs: 30,
 //!         headless: true,
+//!         ..BrowserConfig::default()
 //!     };
 //!
 //!     let crawler = BrowserCrawler::new(config)?;
@@ -41,6 +42,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use headless_chrome::{Browser, LaunchOptions};
 use scraper::{Html, Selector};
 
@@ -67,6 +69,7 @@ use crate::content;
 ///     user_agent: Some("CustomBot/1.0".to_string()),
 ///     timeout_secs: 60,
 ///     headless: true,
+///     ..BrowserConfig::default()
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -95,6 +98,12 @@ pub struct BrowserConfig {
     /// more efficient and suitable for server environments. Set to `false`
     /// for debugging to see the browser's actions visually.
     pub headless: bool,
+
+    /// JS scripts to execute after page load (source, timeout_ms).
+    pub post_load_js: Vec<(String, Option<u64>)>,
+
+    /// Cookies to inject before first navigation.
+    pub initial_cookies: Vec<crate::session::SessionCookie>,
 }
 
 impl Default for BrowserConfig {
@@ -104,6 +113,8 @@ impl Default for BrowserConfig {
             user_agent: Some("Crawlery/1.0".to_string()),
             timeout_secs: 30,
             headless: true,
+            post_load_js: vec![],
+            initial_cookies: vec![],
         }
     }
 }
@@ -159,6 +170,7 @@ pub struct CrawlResult {
 pub struct BrowserCrawler {
     browser: Browser,
     config: BrowserConfig,
+    collected_cookies: Arc<std::sync::Mutex<Vec<crate::session::SessionCookie>>>,
 }
 
 impl BrowserCrawler {
@@ -198,7 +210,11 @@ impl BrowserCrawler {
         }
 
         let browser = Browser::new(launch_options).context("Failed to launch browser")?;
-        Ok(Self { browser, config })
+        Ok(Self {
+            browser,
+            config,
+            collected_cookies: Arc::new(std::sync::Mutex::new(vec![])),
+        })
     }
 
     /// Fetches and processes a URL using the browser, returning the crawl result.
@@ -245,6 +261,43 @@ impl BrowserCrawler {
                 .context("Failed to set user agent")?;
         }
 
+        // Inject session cookies via CDP before navigation (works for any domain)
+        if !self.config.initial_cookies.is_empty() {
+            use headless_chrome::protocol::cdp::Network;
+            let cookies: Vec<Network::CookieParam> = self
+                .config
+                .initial_cookies
+                .iter()
+                .map(|c| {
+                    // Use explicit domain URL so CDP knows which domain to bind the cookie to
+                    let url_str = c
+                        .domain
+                        .as_ref()
+                        .map(|d| format!("https://{}", d.trim_start_matches('.')))
+                        .unwrap_or_else(|| url.to_string());
+                    Network::CookieParam {
+                        name: c.name.clone(),
+                        value: c.value.clone(),
+                        url: Some(url_str),
+                        domain: c.domain.clone(),
+                        path: c.path.clone().or_else(|| Some("/".to_string())),
+                        secure: None,
+                        http_only: None,
+                        same_site: None,
+                        expires: None,
+                        priority: None,
+                        same_party: None,
+                        source_scheme: None,
+                        source_port: None,
+                        partition_key: None,
+                    }
+                })
+                .collect();
+            if let Err(e) = tab.set_cookies(cookies) {
+                eprintln!("[Browser] Warning: Failed to set session cookies: {}", e);
+            }
+        }
+
         eprintln!("[Browser] Navigating to: {}", url);
         tab.navigate_to(url).context("Failed to navigate to URL")?;
         tab.wait_until_navigated()
@@ -253,7 +306,6 @@ impl BrowserCrawler {
         eprintln!("[Browser] Page navigated, waiting for content to load...");
 
         // Wait for DOM to be ready and dynamic content to load
-        // First wait a bit for initial rendering
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // Wait for document ready state
@@ -282,17 +334,77 @@ impl BrowserCrawler {
 
         // Additional wait for JavaScript-rendered content
         std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Run post_load_js hooks
+        for (source, _timeout_ms) in &self.config.post_load_js {
+            if let Err(e) = tab.evaluate(&format!("({})()", source), true) {
+                eprintln!("[Browser] Warning: post_load JS failed: {}", e);
+            }
+        }
+
+        // If hooks ran, allow any triggered navigation (e.g. form submission) to settle.
+        // NOTE: do NOT call wait_until_navigated() here — it can race with Chrome background
+        // navigations (update checks, safe browsing, etc.) and land on the wrong page.
+        // A pure time-based settle + readyState poll is more reliable.
+        if !self.config.post_load_js.is_empty() {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            for _ in 0..15 {
+                match tab.evaluate("document.readyState", false) {
+                    Ok(r) => {
+                        if let Some(v) = r.value {
+                            if serde_json::from_value::<String>(v)
+                                .ok()
+                                .as_deref()
+                                == Some("complete")
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Context may have been destroyed mid-navigation; wait more
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            eprintln!("[Browser] Post-hook page: {}", tab.get_url());
+        }
+
         eprintln!("[Browser] Extracting content...");
 
         let html = tab.get_content().context("Failed to get page content")?;
         eprintln!("[Browser] HTML content length: {} bytes", html.len());
 
-        let base_url = Url::parse(url).context("Invalid URL")?;
+        // Use the tab's current URL (may differ from `url` after redirects/form submission)
+        let actual_url = tab.get_url();
+        let base_url = Url::parse(&actual_url)
+            .or_else(|_| Url::parse(url))
+            .context("Invalid URL")?;
         let links = self.extract_links(&html, &base_url)?;
         eprintln!("[Browser] Extracted {} links", links.len());
 
         let cleaned_content =
-            content::extract_content(&html).unwrap_or_else(|_| Self::clean_content(&html));
+            content::md_readability(&html, &actual_url).unwrap_or_else(|_| Self::clean_content(&html));
+
+        // Collect cookies via CDP (includes HttpOnly cookies invisible to document.cookie)
+        if let Ok(cdp_cookies) = tab.get_cookies() {
+            let mut collected = self.collected_cookies.lock().unwrap();
+            for c in cdp_cookies {
+                // Deduplicate by name+domain
+                if !collected
+                    .iter()
+                    .any(|x| x.name == c.name && x.domain.as_deref() == Some(c.domain.as_str()))
+                {
+                    collected.push(crate::session::SessionCookie {
+                        name: c.name,
+                        value: c.value,
+                        domain: Some(c.domain),
+                        path: Some(c.path),
+                    });
+                }
+            }
+        }
 
         Ok(CrawlResult {
             url: url.to_string(),
@@ -301,6 +413,16 @@ impl BrowserCrawler {
             links,
             status_code: None,
         })
+    }
+
+    /// Collect session data (cookies captured during crawl).
+    pub fn collect_session(&self) -> crate::session::SessionData {
+        let cookies = self.collected_cookies.lock().unwrap().clone();
+        crate::session::SessionData {
+            cookies,
+            headers: std::collections::HashMap::new(),
+            saved_at: None,
+        }
     }
 
     /// Extracts and normalizes all links from the page using JavaScript.
@@ -473,7 +595,8 @@ impl BrowserCrawler {
     ///
     /// This method will navigate to the URL and return all cookies as strings.
     pub fn get_cookies(&self, _url: &str) -> Result<Vec<String>> {
-        anyhow::bail!("Cookie extraction feature not yet implemented")
+        let cookies = self.collected_cookies.lock().unwrap();
+        Ok(cookies.iter().map(|c| format!("{}={}", c.name, c.value)).collect())
     }
 }
 
