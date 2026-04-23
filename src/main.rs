@@ -10,17 +10,13 @@ use std::path::PathBuf;
 #[command(name = "crawlery")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// The starting URL to crawl (required if no recipe or pipeline is provided)
+    /// The starting URL to crawl (required if no recipe is provided)
     #[arg(value_name = "URL")]
     url: Option<String>,
 
     /// Recipe file (YAML config) - contains all crawl settings
     #[arg(short = 'r', long, value_name = "FILE")]
     recipe: Option<PathBuf>,
-
-    /// Run a multi-stage pipeline defined in a YAML file (stages separated by ---)
-    #[arg(long, value_name = "FILE")]
-    pipeline: Option<PathBuf>,
 
     /// Override the recipe's input_from path at runtime
     #[arg(long, value_name = "FILE")]
@@ -45,11 +41,6 @@ async fn main() -> Result<()> {
 
     init_logging(args.verbose);
 
-    // Handle pipeline mode first
-    if let Some(pipeline_path) = &args.pipeline {
-        return run_pipeline(pipeline_path, &args).await;
-    }
-
     // Determine configuration source
     let mut config = if let Some(recipe_path) = &args.recipe {
         if args.verbose {
@@ -60,7 +51,7 @@ async fn main() -> Result<()> {
         build_config_from_args(&args, url)?
     } else {
         anyhow::bail!(
-            "Either a URL, a recipe file (--recipe), or a pipeline (--pipeline) must be provided.\n             Use --help for more information."
+            "Either a URL or a recipe file (--recipe) must be provided.\n             Use --help for more information."
         );
     };
 
@@ -114,10 +105,8 @@ async fn main() -> Result<()> {
 /// Save crawl results, applying extract_fields projection if specified.
 fn save_crawl_results(crawler: &Crawler, results: &[crawlery::CrawlResult]) -> Result<()> {
     if !crawler.config().extract_fields.is_empty() {
-        let projected = crawlery::transformers::project_fields(
-            results,
-            &crawler.config().extract_fields,
-        );
+        let projected =
+            crawlery::transformers::project_fields(results, &crawler.config().extract_fields);
         crawlery::output::save_projected(&projected, crawler.config().output_path.clone())?;
     } else {
         crawlery::output::save_results(
@@ -126,63 +115,6 @@ fn save_crawl_results(crawler: &Crawler, results: &[crawlery::CrawlResult]) -> R
             crawler.config().output_path.clone(),
         )?;
     }
-    Ok(())
-}
-
-/// Run a multi-stage pipeline.
-async fn run_pipeline(path: &PathBuf, args: &Args) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read pipeline file '{}': {}", path.display(), e))?;
-
-    let stages = CrawlConfig::parse_pipeline(&content)?;
-    let stage_count = stages.len();
-
-    if args.verbose {
-        println!("Pipeline: {} stage(s)", stage_count);
-    }
-
-    for (i, mut config) in stages.into_iter().enumerate() {
-        if let Some(output_path) = &args.output {
-            config.output_path = Some(output_path.clone());
-        }
-        if let Some(input_path) = &args.input {
-            config.input_from = Some(input_path.clone());
-        }
-
-        let stage_name = config
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("stage-{}", i + 1));
-
-        let stage_info = if config.input_from.is_some() {
-            format!("(input_from: {})", config.input_from.as_ref().unwrap().display())
-        } else {
-            format!("(url: {})", config.url)
-        };
-
-        println!(
-            "\nPipeline stage {}/{}: {} {}",
-            i + 1,
-            stage_count,
-            stage_name,
-            stage_info
-        );
-
-        let crawler = Crawler::new(config);
-
-        match crawler.crawl().await {
-            Ok(results) => {
-                println!("  Crawled {} pages", results.len());
-                save_crawl_results(&crawler, &results)?;
-            }
-            Err(e) => {
-                eprintln!("  Stage '{}' failed: {}", stage_name, e);
-                return Err(e);
-            }
-        }
-    }
-
-    println!("\nPipeline complete.");
     Ok(())
 }
 
@@ -252,7 +184,10 @@ async fn resume_crawl(config: CrawlConfig, verbose: bool) -> Result<()> {
     };
     println!("Resuming crawl of {}...", url_display);
     println!("Already crawled: {} pages", previous_state.visited_count());
-    println!("Remaining in queue: {} URLs", previous_state.pending_count());
+    println!(
+        "Remaining in queue: {} URLs",
+        previous_state.pending_count()
+    );
 
     let crawler = Crawler::new(config);
 

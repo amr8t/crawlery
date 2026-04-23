@@ -34,11 +34,13 @@ pub mod error;
 pub mod hooks;
 pub mod http_client;
 pub mod output;
+pub mod pipeline;
 pub mod session;
 pub mod state;
 pub mod transformers;
 
 pub use error::{CrawlError, ErrorContext, Result};
+pub use pipeline::{Pipeline, StageBuilder};
 
 // Re-export commonly used types
 pub use reqwest;
@@ -63,10 +65,12 @@ fn load_input_urls(path: &PathBuf) -> Result<Vec<String>> {
             field: "input_from".to_string(),
             message: format!("Failed to parse input file as JSON: {}", e),
         })?;
-    let arr = value.as_array().ok_or_else(|| CrawlError::ValidationError {
-        field: "input_from".to_string(),
-        message: "Input file must be a JSON array".to_string(),
-    })?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| CrawlError::ValidationError {
+            field: "input_from".to_string(),
+            message: "Input file must be a JSON array".to_string(),
+        })?;
     let mut urls = Vec::new();
     for item in arr {
         if let Some(s) = item.as_str() {
@@ -121,16 +125,19 @@ impl Crawler {
 
         // Run crawl
         let mut results = match self.config.mode {
-            CrawlMode::Http => self.crawl_with_http(&mut state, session_data.as_ref()).await?,
+            CrawlMode::Http => {
+                self.crawl_with_http(&mut state, session_data.as_ref())
+                    .await?
+            }
             CrawlMode::Browser => {
-                self.crawl_with_browser(&mut state, session_data.as_ref()).await?
+                self.crawl_with_browser(&mut state, session_data.as_ref())
+                    .await?
             }
         };
 
         // Apply transformers
         if !self.config.transformers.is_empty() {
-            results =
-                transformers::apply_transformers(results, &self.config.transformers).await?;
+            results = transformers::apply_transformers(results, &self.config.transformers).await?;
         }
 
         Ok(results)
@@ -202,7 +209,12 @@ impl Crawler {
                     } else {
                         result.html.clone()
                     };
-                    Ok((result.status_code, result.html.clone(), content, result.links))
+                    Ok((
+                        result.status_code,
+                        result.html.clone(),
+                        content,
+                        result.links,
+                    ))
                 }
             })
             .await?;
@@ -365,9 +377,7 @@ impl Crawler {
                             let mut env = std::collections::HashMap::new();
                             env.insert("URL".to_string(), url.clone());
                             env.insert("STATUS_CODE".to_string(), status_code.to_string());
-                            if let Err(e) =
-                                hooks::run_hooks(&hooks_cfg.post_extract, &env).await
-                            {
+                            if let Err(e) = hooks::run_hooks(&hooks_cfg.post_extract, &env).await {
                                 eprintln!("post_extract hook error for {}: {}", url, e);
                             }
                         }
@@ -540,12 +550,24 @@ impl Crawler {
     }
 }
 
-fn default_crawl_mode() -> CrawlMode { CrawlMode::Http }
-fn default_max_depth() -> usize { 3 }
-fn default_timeout_secs() -> u64 { 30 }
-fn default_max_concurrent_requests() -> usize { 10 }
-fn default_max_retries() -> usize { 3 }
-fn default_output_format() -> OutputFormat { OutputFormat::Json }
+fn default_crawl_mode() -> CrawlMode {
+    CrawlMode::Http
+}
+fn default_max_depth() -> usize {
+    3
+}
+fn default_timeout_secs() -> u64 {
+    30
+}
+fn default_max_concurrent_requests() -> usize {
+    10
+}
+fn default_max_retries() -> usize {
+    3
+}
+fn default_output_format() -> OutputFormat {
+    OutputFormat::Json
+}
 
 /// Configuration for the web crawler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,19 +744,23 @@ impl CrawlConfig {
         Ok(())
     }
 
-    /// Parse a multi-document YAML pipeline file (documents separated by `---`).
-    pub fn parse_pipeline(content: &str) -> Result<Vec<Self>> {
-        let mut configs = Vec::new();
-        for doc in serde_yaml::Deserializer::from_str(content) {
-            let config: CrawlConfig =
-                serde::Deserialize::deserialize(doc).map_err(|e| CrawlError::ValidationError {
-                    field: "pipeline".to_string(),
-                    message: format!("Failed to parse pipeline stage: {}", e),
-                })?;
-            config.validate()?;
-            configs.push(config);
-        }
-        Ok(configs)
+    /// Return this config with the URL replaced.
+    ///
+    /// Useful when loading a recipe template and overriding just the target URL —
+    /// for example in fallback strategies where all other settings should be reused.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use anyhow::Result;
+    /// # fn main() -> Result<()> {
+    /// use crawlery::CrawlConfig;
+    /// let config = CrawlConfig::from_file("recipes/http.yaml")?.with_url("https://example.com/page");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = url.into();
+        self
     }
 }
 
@@ -1141,9 +1167,15 @@ pub enum HookType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Transformer {
-    Filter { condition: FilterCondition },
-    Deduplicator { field: String },
-    ExtractFields { fields: Vec<String> },
+    Filter {
+        condition: FilterCondition,
+    },
+    Deduplicator {
+        field: String,
+    },
+    ExtractFields {
+        fields: Vec<String>,
+    },
     Command {
         cmd: String,
         #[serde(default)]
@@ -1358,10 +1390,7 @@ mod tests {
             loaded_config.exclude_patterns,
             original_config.exclude_patterns
         );
-        assert_eq!(
-            loaded_config.md_readability,
-            original_config.md_readability
-        );
+        assert_eq!(loaded_config.md_readability, original_config.md_readability);
         assert_eq!(loaded_config.headers, original_config.headers);
     }
 

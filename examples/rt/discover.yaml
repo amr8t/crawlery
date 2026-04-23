@@ -1,0 +1,30 @@
+# RT Stage 1: browse page discovery via headless browser.
+# JS post_load hook scrolls to load all movie cards before extraction.
+# Python command transformer extracts movie URLs from result.links and
+# reshapes the output into one CrawlResult per movie URL.
+name: rt_discover
+url: "https://www.rottentomatoes.com/browse/movies_at_home/sort:popular"
+mode: browser
+max_depth: 0
+max_pages: 1
+output_path: "out/rt/discover.json"
+output_format: json-pretty
+timeout_secs: 25
+respect_robots_txt: false
+hooks:
+  post_load:
+    - type: javascript
+      timeout_ms: 8000
+      source: |
+        async function() {
+          // Scroll to trigger lazy-load of movie card links
+          window.scrollTo(0, document.body.scrollHeight / 2);
+          await new Promise(r => setTimeout(r, 1500));
+          window.scrollTo(0, document.body.scrollHeight);
+          await new Promise(r => setTimeout(r, 1500));
+        }
+transformers:
+  - type: command
+    cmd: python3
+    args: ["examples/rt/scripts/extract_links.py"]
+    timeout_ms: 10000

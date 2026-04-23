@@ -13,5 +13,5 @@ transformers:
       expression: "status_code == 200"
   - type: command
     cmd: python3
-    args: ["examples/recipes/hn_crawl/clean_content.py"]
+    args: ["examples/hn_crawl/scripts/clean_content.py"]
     timeout_ms: 15000

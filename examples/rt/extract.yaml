@@ -1,0 +1,39 @@
+# RT Stage 2: per-movie synopsis extraction.
+# input_from is injected automatically by the Pipeline from Stage 1 results.
+# md_readability produces clean text; transformers filter, dedup, then
+# a Python script isolates the synopsis paragraph and sets metadata flags.
+name: rt_extract
+url: "https://www.rottentomatoes.com/m/the_shawshank_redemption"
+mode: http
+max_depth: 0
+max_pages: 15
+output_path: "out/rt/extract.json"
+output_format: json-pretty
+md_readability: true
+timeout_secs: 20
+delay_ms: 700
+max_retries: 2
+max_concurrent_requests: 2
+follow_redirects: true
+respect_robots_txt: false
+headers:
+  User-Agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+  Accept-Language: "en-US,en;q=0.9"
+transformers:
+  - type: filter
+    condition:
+      expression: "status_code == 200"
+  - type: deduplicator
+    field: url
+  - type: command
+    cmd: python3
+    args: ["examples/rt/scripts/clean_synopsis.py"]
+    timeout_ms: 15000
+hooks:
+  post_extract:
+    - type: command
+      cmd: sh
+      args:
+        ["-c", 'echo "[rt_extract] page done: $URL (HTTP $STATUS_CODE)" >&2']
+      timeout_ms: 2000

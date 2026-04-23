@@ -191,6 +191,28 @@ Perfect for:
 - Rate-limited sites requiring breaks
 - Incremental documentation updates
 
+
+## Code-Based Pipeline Composition
+
+Use the `Pipeline` builder to compose multi-stage crawls in Rust -- conditional execution,
+fork-join splitting, and runtime config overrides -- without touching any YAML.
+
+### Quick Example
+
+```rust
+use crawlery::pipeline::Pipeline;
+
+let results = Pipeline::new()
+    .stage("discover", "recipes/discover.yaml").end()
+    .stage("extract", "recipes/extract.yaml")
+        .when(|prev| !prev.is_empty())        // skip if nothing found
+    .end()
+    .run().await?;
+```
+
+Each stage's results are forwarded as URL inputs to the next stage automatically.
+Use `.transform()` to reshape results in-process before they are forwarded.
+
 ## Documentation
 
 Full API documentation: `cargo doc --open`

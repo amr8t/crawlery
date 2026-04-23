@@ -1,7 +1,7 @@
 # Stage 2: Scrape the first two HN listing pages using the saved session.
 # input_from feeds pre-defined page URLs; HTTP mode is faster than browser.
 name: hn_crawl
-input_from: "examples/recipes/hn_crawl/hn_pages.json"
+input_from: "examples/hn_crawl/hn_pages.json"
 mode: http
 max_depth: 0
 delay_ms: 500
@@ -19,5 +19,5 @@ transformers:
     field: url
   - type: command
     cmd: python3
-    args: ["examples/recipes/hn_crawl/clean_content.py"]
+    args: ["examples/hn_crawl/scripts/clean_content.py"]
     timeout_ms: 10000
