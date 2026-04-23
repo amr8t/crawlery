@@ -4,16 +4,13 @@ A fast, efficient and customizable web crawler built in Rust. Extracts clean con
 
 ## Features
 
-- 🚀 Dual crawling modes: HTTP (fast) & headless Chrome (JavaScript support)
-- 🧠 Optional content extraction: Enable readability-style cleaning for RAG/LLM applications
-- 📝 Flexible output: Raw HTML (default) or clean Markdown for LLM ingestion
-- 🏷️ Metadata extraction: Title, author, date, description from OpenGraph/Schema.org
-- 🔄 Resumable crawling: State persistence for interrupted crawls with automatic resume
-- 📋 Recipe files: YAML-based configuration for reproducible crawls
-- 🎯 Auto-discovery: Configurable depth and intelligent link following
-- 🔍 URL filtering: Regex include/exclude patterns
-- 🌐 Proxy rotation: Multi-proxy support
-- 📊 Multiple formats: JSON, Markdown, CSV, Text
+- Dual crawling modes: HTTP (fast) & headless Chrome (JavaScript support)
+- Optional content extraction: Enable readability-style cleaning for RAG/LLM applications
+- Metadata extraction: Title, author, date, description from OpenGraph/Schema.org
+- Resumable crawling: State persistence for interrupted crawls with automatic resume
+- Recipe files: YAML-based configuration for reproducible crawls
+- Auto-discovery: Configurable depth and intelligent link following
+- URL filtering: Regex include/exclude patterns
 
 ## Quick Start
 
