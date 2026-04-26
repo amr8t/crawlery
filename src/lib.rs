@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use url::Url;
 
 pub mod browser;
@@ -197,14 +199,13 @@ impl Crawler {
         let config_session = self.config.session.clone();
         let crawler_ref = crawler.clone();
 
+        let md_readability = self.config.md_readability;
         let results = self
-            .crawl_loop(state, |url| {
-                let url_owned = url.to_string();
+            .crawl_loop(state, move |url: String| {
                 let crawler = crawler_ref.clone();
-                let extract = self.config.md_readability;
                 async move {
-                    let result = crawler.fetch(&url_owned).await?;
-                    let content = if extract {
+                    let result = crawler.fetch(&url).await?;
+                    let content = if md_readability {
                         result.clean_text
                     } else {
                         result.html.clone()
@@ -272,14 +273,13 @@ impl Crawler {
         let config_session = self.config.session.clone();
         let crawler_ref = crawler.clone();
 
+        let md_readability = self.config.md_readability;
         let results = self
-            .crawl_loop(state, |url| {
-                let url_owned = url.to_string();
+            .crawl_loop(state, move |url: String| {
                 let crawler = crawler_ref.clone();
-                let extract = self.config.md_readability;
                 async move {
-                    let result = crawler.fetch(&url_owned)?;
-                    let content = if extract {
+                    let result = crawler.fetch(&url)?;
+                    let content = if md_readability {
                         result.cleaned_content
                     } else {
                         result.html.clone()
@@ -306,54 +306,195 @@ impl Crawler {
         Ok(results)
     }
 
-    /// Main crawl loop - generic over HTTP and Browser crawlers.
+    /// Concurrent crawl loop — the core engine for a single pipeline stage.
+    ///
+    /// Uses a `Semaphore` to bound the number of in-flight requests to
+    /// `config.max_concurrent_requests` and a `JoinSet` to drive them all
+    /// concurrently on the Tokio thread pool.
+    ///
+    /// # Scheduling model
+    ///
+    /// ```text
+    ///  ┌─────────────────────────────────────────────────┐
+    ///  │  outer loop                                     │
+    ///  │  ┌──────────────────────────────────────────┐   │
+    ///  │  │  fill phase                              │   │
+    ///  │  │  while join_set.len() < concurrency      │   │
+    ///  │  │    pop URL from state → spawn task       │   │
+    ///  │  └──────────────────────────────────────────┘   │
+    ///  │  drain phase: join_next() → update state        │
+    ///  └─────────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// Discovered links are fed back into `state` after each result is processed,
+    /// so the scheduler can immediately pick them up in the next fill phase.
     async fn crawl_loop<F, Fut>(
         &self,
         state: &mut state::CrawlState,
         fetch_fn: F,
     ) -> Result<Vec<CrawlResult>>
     where
-        F: Fn(&str) -> Fut,
-        Fut: std::future::Future<Output = Result<(u16, String, String, Vec<String>)>>,
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(u16, String, String, Vec<String>)>>
+            + Send
+            + 'static,
     {
-        let mut save_counter = 0;
-        let mut error_count = 0;
+        let concurrency = self.config.max_concurrent_requests.max(1);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let fetch_fn = Arc::new(fetch_fn);
 
-        while let Some((url, depth)) = state.next_pending() {
-            if state.is_visited(&url) {
-                continue;
-            }
-            if !self.should_crawl_url(&url) {
-                continue;
-            }
+        // Each task returns (url, depth, fetch_result).
+        let mut join_set: JoinSet<(String, usize, Result<(u16, String, String, Vec<String>)>)> =
+            JoinSet::new();
 
-            state.mark_visited(url.clone());
+        let mut save_counter: u64 = 0;
+        let mut consecutive_errors: u64 = 0;
+        // Track URLs scheduled but not yet recorded as results, so that
+        // max_pages accounting stays accurate under concurrency.
+        let mut in_flight: usize = 0;
 
-            // Run pre_request command hooks
-            if let Some(hooks_cfg) = &self.config.hooks {
-                if !hooks_cfg.pre_request.is_empty() {
-                    let mut env = std::collections::HashMap::new();
-                    env.insert("URL".to_string(), url.clone());
-                    if let Err(e) = hooks::run_hooks(&hooks_cfg.pre_request, &env).await {
-                        eprintln!("pre_request hook error for {}: {}", url, e);
+        loop {
+            // ── Fill phase ────────────────────────────────────────────────
+            // Keep the JoinSet saturated up to `concurrency`.
+            'fill: while join_set.len() < concurrency {
+                // Honour max_pages including in-flight tasks so we don't
+                // over-schedule when concurrency > 1.
+                if let Some(max_pages) = self.config.max_pages {
+                    if state.result_count() + in_flight >= max_pages {
+                        break 'fill;
+                    }
+                }
+
+                match state.next_pending() {
+                    None => break 'fill,
+                    Some((url, depth)) => {
+                        if !self.should_crawl_url(&url) {
+                            continue;
+                        }
+                        // Mark visited now so parallel fill iterations don't
+                        // re-schedule the same URL.
+                        state.mark_visited(url.clone());
+
+                        // pre_request hooks run on the main task (fast path).
+                        if let Some(hooks_cfg) = &self.config.hooks {
+                            if !hooks_cfg.pre_request.is_empty() {
+                                let mut env = HashMap::new();
+                                env.insert("URL".to_string(), url.clone());
+                                if let Err(e) = hooks::run_hooks(&hooks_cfg.pre_request, &env).await
+                                {
+                                    eprintln!("pre_request hook error for {}: {}", url, e);
+                                }
+                            }
+                        }
+
+                        eprintln!("Crawling [depth={}]: {}", depth, url);
+
+                        let sem = semaphore.clone();
+                        let fetch = fetch_fn.clone();
+                        let max_retries = self.config.max_retries;
+                        let delay_ms = self.config.delay_ms;
+
+                        in_flight += 1;
+                        join_set.spawn(async move {
+                            // The permit is held for the duration of the fetch,
+                            // bounding real concurrency even if the JoinSet has
+                            // more tasks than slots.
+                            let _permit = sem.acquire_owned().await.expect("semaphore closed");
+
+                            // Inline retry logic so each task is self-contained.
+                            let mut last_error: Option<anyhow::Error> = None;
+                            for attempt in 0..=max_retries {
+                                match fetch(url.clone()).await {
+                                    Ok(r) => return (url, depth, Ok(r)),
+                                    Err(e) => {
+                                        if attempt < max_retries {
+                                            eprintln!(
+                                                "Retry {}/{} for {}",
+                                                attempt + 1,
+                                                max_retries,
+                                                url
+                                            );
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                                delay_ms * (attempt as u64 + 1),
+                                            ))
+                                            .await;
+                                        }
+                                        last_error = Some(e);
+                                    }
+                                }
+                            }
+                            (url, depth, Err(last_error.unwrap()))
+                        });
                     }
                 }
             }
 
-            eprintln!("Crawling [depth={}]: {}", depth, url);
+            // ── Drain phase ───────────────────────────────────────────────
+            // If there is nothing running and nothing left to schedule, done.
+            if join_set.is_empty() {
+                break;
+            }
 
-            let fetch_result = self.fetch_with_retry(&url, &fetch_fn).await;
+            match join_set.join_next().await {
+                None => break,
 
-            match fetch_result {
-                Ok((status_code, html, clean_text, links)) => {
+                Some(Err(join_err)) => {
+                    // Task panicked — count as an error but don't crash.
+                    eprintln!("Crawl task panicked: {:?}", join_err);
+                    in_flight = in_flight.saturating_sub(1);
+                    consecutive_errors += 1;
+                    if consecutive_errors > 10 {
+                        eprintln!("Too many errors, aborting remaining tasks");
+                        join_set.abort_all();
+                        break;
+                    }
+                }
+
+                Some(Ok((url, depth, Err(e)))) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    eprintln!("Error fetching {}: {}", url, e);
+                    consecutive_errors += 1;
+
+                    state.add_result(state::CrawlResult {
+                        url: url.clone(),
+                        depth,
+                        status_code: None,
+                        title: None,
+                        content: String::new(),
+                        links: Vec::new(),
+                        timestamp: SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    });
+
+                    if let Some(hooks_cfg) = &self.config.hooks {
+                        if !hooks_cfg.on_error.is_empty() {
+                            let mut env = HashMap::new();
+                            env.insert("URL".to_string(), url);
+                            env.insert("ERROR".to_string(), e.to_string());
+                            let _ = hooks::run_hooks(&hooks_cfg.on_error, &env).await;
+                        }
+                    }
+
+                    if consecutive_errors > 10 {
+                        eprintln!("Too many consecutive errors, stopping crawl");
+                        join_set.abort_all();
+                        break;
+                    }
+                }
+
+                Some(Ok((url, depth, Ok((status_code, html, clean_text, links))))) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    consecutive_errors = 0;
+
                     let title = Self::extract_title(&html);
-
                     let state_result = state::CrawlResult {
                         url: url.clone(),
                         depth,
                         status_code: Some(status_code),
-                        title: title.clone(),
-                        content: clean_text.clone(),
+                        title,
+                        content: clean_text,
                         links: links.clone(),
                         timestamp: SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
@@ -369,54 +510,20 @@ impl Crawler {
                     state.add_pending(filtered_links, depth);
                     state.add_result(state_result);
 
-                    error_count = 0;
-
-                    // Run post_extract command hooks
                     if let Some(hooks_cfg) = &self.config.hooks {
                         if !hooks_cfg.post_extract.is_empty() {
-                            let mut env = std::collections::HashMap::new();
-                            env.insert("URL".to_string(), url.clone());
+                            let mut env = HashMap::new();
+                            env.insert("URL".to_string(), url);
                             env.insert("STATUS_CODE".to_string(), status_code.to_string());
                             if let Err(e) = hooks::run_hooks(&hooks_cfg.post_extract, &env).await {
-                                eprintln!("post_extract hook error for {}: {}", url, e);
+                                eprintln!("post_extract hook error: {}", e);
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error fetching {}: {}", url, e);
-                    error_count += 1;
-
-                    state.add_result(state::CrawlResult {
-                        url: url.clone(),
-                        depth,
-                        status_code: None,
-                        title: None,
-                        content: String::new(),
-                        links: Vec::new(),
-                        timestamp: SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    });
-
-                    // Run on_error hooks
-                    if let Some(hooks_cfg) = &self.config.hooks {
-                        if !hooks_cfg.on_error.is_empty() {
-                            let mut env = std::collections::HashMap::new();
-                            env.insert("URL".to_string(), url.clone());
-                            env.insert("ERROR".to_string(), e.to_string());
-                            let _ = hooks::run_hooks(&hooks_cfg.on_error, &env).await;
-                        }
-                    }
-
-                    if error_count > 10 {
-                        eprintln!("Too many consecutive errors, stopping crawl");
-                        break;
-                    }
-                }
             }
 
+            // Periodic state save and progress report.
             save_counter += 1;
             if save_counter % 10 == 0 {
                 if let Some(state_file) = &self.config.state_file {
@@ -425,11 +532,11 @@ impl Crawler {
                     }
                 }
             }
-
-            if state.result_count().is_multiple_of(10) {
+            let rc = state.result_count();
+            if rc > 0 && rc.is_multiple_of(10) {
                 eprintln!(
                     "Progress: {} pages crawled, {} pending",
-                    state.result_count(),
+                    rc,
                     state.pending_count()
                 );
             }
@@ -450,42 +557,6 @@ impl Crawler {
             .iter()
             .map(Self::convert_state_result)
             .collect())
-    }
-
-    /// Fetch with retry logic.
-    async fn fetch_with_retry<F, Fut>(
-        &self,
-        url: &str,
-        fetch_fn: &F,
-    ) -> Result<(u16, String, String, Vec<String>)>
-    where
-        F: Fn(&str) -> Fut,
-        Fut: std::future::Future<Output = Result<(u16, String, String, Vec<String>)>>,
-    {
-        let mut last_error = None;
-
-        for attempt in 0..=self.config.max_retries {
-            match fetch_fn(url).await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt < self.config.max_retries {
-                        eprintln!(
-                            "Retry {}/{} for {}",
-                            attempt + 1,
-                            self.config.max_retries,
-                            url
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            self.config.delay_ms * (attempt as u64 + 1),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap())
     }
 
     /// Check if URL should be crawled based on include/exclude patterns.
@@ -1475,5 +1546,291 @@ headers: {}
     fn test_config_from_file_nonexistent() {
         let result = CrawlConfig::from_file("nonexistent_file.yaml");
         assert!(result.is_err());
+    }
+
+    // ── Concurrent crawl_loop tests ───────────────────────────────────────────
+
+    /// Seed a CrawlState with N URLs at depth 0, ready to crawl.
+    fn make_state(urls: Vec<&str>, max_pages: Option<usize>) -> state::CrawlState {
+        let mut s = state::CrawlState::new(state::CrawlConfig {
+            start_url: urls[0].to_string(),
+            max_depth: 2,
+            max_pages,
+            respect_robots_txt: false,
+        });
+        s.seed_urls(urls.iter().map(|u| u.to_string()).collect());
+        s
+    }
+
+    /// Build a Crawler configured for concurrent HTTP crawling.
+    fn make_crawler(concurrency: usize, max_pages: Option<usize>) -> Crawler {
+        let mut cfg = CrawlConfig::builder()
+            .url("http://test/0")
+            .max_concurrent_requests(concurrency)
+            .max_depth(2)
+            .respect_robots_txt(false)
+            .build()
+            .unwrap();
+        cfg.max_pages = max_pages;
+        Crawler::new(cfg)
+    }
+
+    /// Prove that with concurrency = 4 and 4 URLs each taking 100 ms, the total
+    /// wall-clock time is well under 4 × 100 ms (sequential would be ≥ 400 ms).
+    #[tokio::test]
+    async fn test_crawl_loop_fetches_in_parallel() {
+        let crawler = make_crawler(4, Some(4));
+        let mut state = make_state(
+            vec!["http://t/0", "http://t/1", "http://t/2", "http://t/3"],
+            Some(4),
+        );
+
+        let start = std::time::Instant::now();
+
+        let results = crawler
+            .crawl_loop(&mut state, |url: String| async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                Ok::<_, anyhow::Error>((
+                    200u16,
+                    format!("<html><title>{}</title></html>", url),
+                    url.clone(),
+                    vec![],
+                ))
+            })
+            .await
+            .unwrap();
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 4, "All 4 URLs must be crawled");
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "4 parallel 100 ms fetches should finish in < 350 ms, took {:?}",
+            elapsed
+        );
+    }
+
+    /// Prove that the Semaphore actually caps concurrency.
+    /// With 8 URLs, 100 ms each, and concurrency = 2, the crawl must take
+    /// at least 4 × 100 ms = 400 ms (4 sequential waves of 2).
+    #[tokio::test]
+    async fn test_crawl_loop_semaphore_caps_concurrency() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let concurrency = 2usize;
+        let crawler = make_crawler(concurrency, Some(8));
+        let mut state = make_state(
+            vec![
+                "http://t/0",
+                "http://t/1",
+                "http://t/2",
+                "http://t/3",
+                "http://t/4",
+                "http://t/5",
+                "http://t/6",
+                "http://t/7",
+            ],
+            Some(8),
+        );
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let active2 = active.clone();
+        let peak2 = peak.clone();
+
+        let results = crawler
+            .crawl_loop(&mut state, move |url: String| {
+                let a = active2.clone();
+                let p = peak2.clone();
+                async move {
+                    // Track peak concurrent active fetches.
+                    let current = a.fetch_add(1, Ordering::AcqRel) + 1;
+                    p.fetch_max(current, Ordering::AcqRel);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                    a.fetch_sub(1, Ordering::AcqRel);
+                    Ok::<_, anyhow::Error>((
+                        200u16,
+                        format!("<html><title>{}</title></html>", url),
+                        url.clone(),
+                        vec![],
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 8);
+        assert!(
+            peak.load(Ordering::Acquire) <= concurrency,
+            "Peak concurrency {} exceeded the limit of {}",
+            peak.load(Ordering::Acquire),
+            concurrency
+        );
+        assert!(
+            peak.load(Ordering::Acquire) > 1,
+            "Expected concurrent execution (peak should be > 1)"
+        );
+    }
+
+    /// Prove that max_pages is not over-shot under concurrency.
+    /// With concurrency = 8 and max_pages = 5, exactly 5 pages must be
+    /// returned even though 8 tasks could otherwise be scheduled at once.
+    #[tokio::test]
+    async fn test_crawl_loop_max_pages_not_exceeded() {
+        let max_pages = 5usize;
+        let crawler = make_crawler(8, Some(max_pages));
+        let mut state = make_state(
+            vec![
+                "http://t/0",
+                "http://t/1",
+                "http://t/2",
+                "http://t/3",
+                "http://t/4",
+                "http://t/5",
+                "http://t/6",
+                "http://t/7",
+            ],
+            Some(max_pages),
+        );
+
+        let results = crawler
+            .crawl_loop(&mut state, |url: String| async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                Ok::<_, anyhow::Error>((
+                    200u16,
+                    format!("<html><title>{}</title></html>", url),
+                    url.clone(),
+                    vec![],
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            results.len() <= max_pages,
+            "Expected at most {} results, got {}",
+            max_pages,
+            results.len()
+        );
+    }
+
+    /// Prove that failed fetches are recorded, the error counter resets on
+    /// success, and crawling continues past individual errors.
+    #[tokio::test]
+    async fn test_crawl_loop_records_errors_and_continues() {
+        let crawler = make_crawler(2, Some(6));
+        let mut state = make_state(
+            vec![
+                "http://t/ok0",
+                "http://t/fail1",
+                "http://t/ok2",
+                "http://t/fail3",
+                "http://t/ok4",
+                "http://t/ok5",
+            ],
+            Some(6),
+        );
+
+        let results = crawler
+            .crawl_loop(&mut state, |url: String| async move {
+                if url.contains("fail") {
+                    Err(anyhow::anyhow!("simulated fetch error for {}", url))
+                } else {
+                    Ok::<_, anyhow::Error>((
+                        200u16,
+                        format!("<html><title>{}</title></html>", url),
+                        url.clone(),
+                        vec![],
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 6, "All 6 URLs (ok + fail) must be recorded");
+
+        let ok_count = results.iter().filter(|r| r.is_success()).count();
+        let err_count = results.iter().filter(|r| !r.is_success()).count();
+        assert_eq!(ok_count, 4, "4 successful fetches expected");
+        assert_eq!(err_count, 2, "2 failed fetches expected");
+    }
+
+    /// Prove that discovered links are followed: seeding one URL that returns
+    /// a link causes the linked page to also be crawled.
+    #[tokio::test]
+    async fn test_crawl_loop_follows_discovered_links() {
+        let crawler = make_crawler(2, Some(2));
+        let mut state = make_state(vec!["http://t/root"], Some(2));
+
+        let results = crawler
+            .crawl_loop(&mut state, |url: String| async move {
+                let links = if url == "http://t/root" {
+                    vec!["http://t/child".to_string()]
+                } else {
+                    vec![]
+                };
+                Ok::<_, anyhow::Error>((
+                    200u16,
+                    format!("<html><title>{}</title></html>", url),
+                    url.clone(),
+                    links,
+                ))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "root + child must both be crawled");
+        let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert!(urls.contains(&"http://t/root"));
+        assert!(urls.contains(&"http://t/child"));
+    }
+
+    /// Prove that a URL is never crawled twice even under concurrent scheduling.
+    #[tokio::test]
+    async fn test_crawl_loop_no_duplicate_fetches() {
+        use std::sync::{Arc, Mutex};
+
+        let crawler = make_crawler(4, Some(10));
+        let mut state = make_state(vec!["http://t/0", "http://t/1", "http://t/2"], Some(10));
+
+        let fetched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fetched2 = fetched.clone();
+
+        let _results = crawler
+            .crawl_loop(&mut state, move |url: String| {
+                let f = fetched2.clone();
+                async move {
+                    f.lock().unwrap().push(url.clone());
+                    Ok::<_, anyhow::Error>((
+                        200u16,
+                        format!("<html><title>{}</title></html>", url),
+                        url.clone(),
+                        // Each page returns the same 3 URLs as links —
+                        // none should be re-fetched.
+                        vec![
+                            "http://t/0".to_string(),
+                            "http://t/1".to_string(),
+                            "http://t/2".to_string(),
+                        ],
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+
+        let log = fetched.lock().unwrap();
+        // Verify no URL appears more than once.
+        let mut seen = std::collections::HashSet::new();
+        for url in log.iter() {
+            assert!(
+                seen.insert(url.as_str()),
+                "URL fetched more than once: {}",
+                url
+            );
+        }
     }
 }

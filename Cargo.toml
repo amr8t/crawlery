@@ -67,6 +67,3 @@ path = "src/main.rs"
 opt-level = 3
 lto = true
 codegen-units = 1
-[[example]]
-name = "rt_movies"
-path = "examples/rt_movies.rs"
