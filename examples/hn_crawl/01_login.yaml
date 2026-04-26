@@ -20,8 +20,8 @@ hooks:
           var acct = document.querySelector('input[name="acct"]');
           var pw   = document.querySelector('input[name="pw"]');
           if (acct && pw) {
-            acct.value = 'marty9x9';
-            pw.value   = 'password';
+            acct.value = '${HN_USERNAME}';
+            pw.value   = '${HN_PASSWORD}';
             document.querySelector('form').submit();
           }
           await new Promise(r => setTimeout(r, 5000));
